@@ -923,7 +923,7 @@ def render_chord_pdf(c: canvas.Canvas, text: str, bx: float, by: float, bw: floa
     if not text or not text.strip():
         return
     pieces = [parse_chord_token(tok, mode) for tok in text.strip().split()]
-    base_font, sup_font, base_size, sup_size = "Times-Italic", "Times-Italic", 13, 8
+    base_font, sup_font, base_size, sup_size = "Times-BoldItalic", "Times-BoldItalic", 15, 9
     seg_widths = []
     for base, sup, slash in pieces:
         w = stringWidth(base, base_font, base_size)
