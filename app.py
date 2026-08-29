@@ -37,8 +37,8 @@ def collect_data() -> dict:
                 "name": st.session_state.get(f"name_{sid}", ""),
                 "measure_count": n,
                 "repeats": st.session_state.get(f"repeats_{sid}", 1),
-                "key_shift": st.session_state.get(f"keyshift_{sid}", 0),
                 "measures": [st.session_state.get(f"m_{sid}_{i}", "") for i in range(n)],
+                "key_changes": [get_key_change(sid, i) for i in range(n)],
             }
         )
     return {
@@ -89,12 +89,20 @@ def load_from_disk():
         order.append(sid)
         st.session_state[f"name_{sid}"] = sec.get("name", "")
         st.session_state[f"repeats_{sid}"] = sec.get("repeats", 1)
-        st.session_state[f"keyshift_{sid}"] = sec.get("key_shift", 0)
         measures = sec.get("measures", [])
         mc = sec.get("measure_count", len(measures) or 8)
         st.session_state[f"mcount_{sid}"] = mc
         for i in range(mc):
             st.session_state[f"m_{sid}_{i}"] = measures[i] if i < len(measures) else ""
+
+        key_changes = sec.get("key_changes")
+        if key_changes is None:
+            # migrate from the older whole-section key_shift, if present
+            old_shift = sec.get("key_shift", 0)
+            key_changes = [old_shift if (old_shift and idx == 0) else None for idx in range(mc)]
+        for i in range(mc):
+            v = key_changes[i] if i < len(key_changes) else None
+            set_key_change(sid, i, v)
     if order:
         st.session_state["section_order"] = order
         st.session_state["next_id"] = max_id + 1
@@ -214,6 +222,30 @@ def major_scale(tonic: str):
 
 def shift_key(base_key: str, semitones: int) -> str:
     return KEY_BY_SEMITONE[(note_semitone(base_key) + semitones) % 12]
+
+
+# ---- per-measure key changes (modulation) ----------------------------------
+# A measure may carry an explicit semitone shift (clamped to -6..+6). Once
+# set, it stays in effect for that measure and every later measure in the
+# chart, until a different measure sets a new one.
+NO_KEY_CHANGE = "–"
+KEY_CHANGE_OPTIONS = [NO_KEY_CHANGE] + list(range(-6, 7))
+
+
+def key_change_label(v) -> str:
+    if v == NO_KEY_CHANGE:
+        return NO_KEY_CHANGE
+    return "0" if v == 0 else f"{v:+d}"
+
+
+def get_key_change(sid: int, idx: int):
+    v = st.session_state.get(f"mkey_{sid}_{idx}", NO_KEY_CHANGE)
+    return None if v == NO_KEY_CHANGE else v
+
+
+def set_key_change(sid: int, idx: int, v):
+    v = NO_KEY_CHANGE if v is None else max(-6, min(6, int(v)))
+    st.session_state[f"mkey_{sid}_{idx}"] = v
 
 
 # ---- roman numeral -> chord name -------------------------------------------
@@ -393,10 +425,10 @@ def new_section(measure_count: int = 8):
     st.session_state["section_order"].append(sid)
     st.session_state[f"name_{sid}"] = ""
     st.session_state[f"repeats_{sid}"] = 1
-    st.session_state[f"keyshift_{sid}"] = 0
     st.session_state[f"mcount_{sid}"] = measure_count
     for i in range(measure_count):
         st.session_state[f"m_{sid}_{i}"] = ""
+        set_key_change(sid, i, None)
 
 
 def remove_section(sid: int):
@@ -417,6 +449,7 @@ def on_measure_count_change(sid: int):
     st.session_state[f"mcount_{sid}"] = n
     for i in range(n):
         st.session_state.setdefault(f"m_{sid}_{i}", "")
+        st.session_state.setdefault(f"mkey_{sid}_{i}", NO_KEY_CHANGE)
 
 
 def on_measure_text_change(sid: int, idx: int):
@@ -436,9 +469,11 @@ def copy_measures(sid: int, letter: str, start_1idx: int, end_1idx: int):
     if end <= start:
         return
     texts = [st.session_state.get(f"m_{sid}_{i}", "") for i in range(start, end)]
+    key_changes = [get_key_change(sid, i) for i in range(start, end)]
     st.session_state["clipboard"] = {
         "type": "measures",
         "data": texts,
+        "key_changes": key_changes,
         "desc": f"{len(texts)} measure{'s' if len(texts) != 1 else ''} from section {letter} (m.{start + 1}–{end})",
     }
 
@@ -450,8 +485,8 @@ def copy_section(sid: int, letter: str):
         "data": {
             "name": st.session_state.get(f"name_{sid}", ""),
             "repeats": st.session_state.get(f"repeats_{sid}", 1),
-            "key_shift": st.session_state.get(f"keyshift_{sid}", 0),
             "measures": [st.session_state.get(f"m_{sid}_{i}", "") for i in range(n)],
+            "key_changes": [get_key_change(sid, i) for i in range(n)],
         },
         "desc": f"section {letter} ({n} measures)",
     }
@@ -462,13 +497,18 @@ def paste_measures_into(sid: int, at_1idx: int):
     if not clip or clip["type"] != "measures":
         return
     texts = clip["data"]
+    kchanges = clip.get("key_changes", [None] * len(texts))
     n = st.session_state[f"mcount_{sid}"]
-    old = [st.session_state.get(f"m_{sid}_{i}", "") for i in range(n)]
+    old_texts = [st.session_state.get(f"m_{sid}_{i}", "") for i in range(n)]
+    old_keys = [get_key_change(sid, i) for i in range(n)]
     at = max(0, min(at_1idx - 1, n))
-    new_list = (old[:at] + list(texts) + old[at:])[:64]
-    st.session_state[f"mcount_{sid}"] = len(new_list)
-    for i, v in enumerate(new_list):
+    new_texts = (old_texts[:at] + list(texts) + old_texts[at:])[:64]
+    new_keys = (old_keys[:at] + list(kchanges) + old_keys[at:])[:64]
+    st.session_state[f"mcount_{sid}"] = len(new_texts)
+    for i, v in enumerate(new_texts):
         st.session_state[f"m_{sid}_{i}"] = v
+    for i, v in enumerate(new_keys):
+        set_key_change(sid, i, v)
 
 
 def paste_section_after(after_sid):
@@ -480,11 +520,13 @@ def paste_section_after(after_sid):
     st.session_state["next_id"] += 1
     st.session_state[f"name_{new_sid}"] = data["name"]
     st.session_state[f"repeats_{new_sid}"] = data["repeats"]
-    st.session_state[f"keyshift_{new_sid}"] = data.get("key_shift", 0)
     measures = data["measures"]
+    key_changes = data.get("key_changes", [None] * len(measures))
     st.session_state[f"mcount_{new_sid}"] = len(measures)
     for i, v in enumerate(measures):
         st.session_state[f"m_{new_sid}_{i}"] = v
+    for i, v in enumerate(key_changes):
+        set_key_change(new_sid, i, v)
     order = st.session_state["section_order"]
     if after_sid is None:
         order.append(new_sid)
@@ -499,11 +541,13 @@ def replace_section(sid: int):
     data = clip["data"]
     st.session_state[f"name_{sid}"] = data["name"]
     st.session_state[f"repeats_{sid}"] = data["repeats"]
-    st.session_state[f"keyshift_{sid}"] = data.get("key_shift", 0)
     measures = data["measures"]
+    key_changes = data.get("key_changes", [None] * len(measures))
     st.session_state[f"mcount_{sid}"] = len(measures)
     for i, v in enumerate(measures):
         st.session_state[f"m_{sid}_{i}"] = v
+    for i, v in enumerate(key_changes):
+        set_key_change(sid, i, v)
 
 
 def clear_clipboard():
@@ -528,10 +572,10 @@ if "initialized" not in st.session_state:
     st.session_state["section_order"] = [1]
     st.session_state["name_1"] = ""
     st.session_state["repeats_1"] = 1
-    st.session_state["keyshift_1"] = 0
     st.session_state["mcount_1"] = 8
     for i in range(8):
         st.session_state[f"m_1_{i}"] = ""
+        set_key_change(1, i, None)
     load_from_disk()  # pull in a previously saved chart, if one exists
 
 # --------------------------------------------------------------------------
@@ -567,6 +611,7 @@ st.markdown(
     .measure-box {{ position:relative; flex:1; min-width:86px; min-height:60px; display:flex; align-items:center; justify-content:center;
                     border-top:1.5px solid {INK}; border-bottom:1.5px solid {INK}; }}
     .measure-index {{ position:absolute; top:3px; left:7px; font-family:'JetBrains Mono',monospace; font-size:9px; color:{RULE}; }}
+    .key-change {{ position:absolute; top:3px; right:7px; font-family:'JetBrains Mono',monospace; font-size:9px; font-weight:600; color:{ACCENT}; }}
     .chord {{ font-family:'EB Garamond', serif; font-style:italic; font-size:21px; color:{INK}; }}
     .chord-token {{ margin: 0 6px; white-space: nowrap; }}
     .chord-token sup {{ font-size:0.6em; margin-left:1px; }}
@@ -706,14 +751,7 @@ with editor_col:
                 st.number_input("Repeat ×", min_value=1, max_value=20, key=f"repeats_{sid}")
 
             if st.session_state["input_mode"] == "roman":
-                st.number_input(
-                    "Key change (semitones from original key)",
-                    min_value=-24, max_value=24, step=1, key=f"keyshift_{sid}",
-                )
-                shift = st.session_state[f"keyshift_{sid}"]
-                if shift != 0:
-                    eff_key = shift_key(st.session_state.get("publish_key", "C"), shift)
-                    st.caption(f"This section modulates to {eff_key} ({shift:+d} semitones)")
+                st.caption("Roman-numeral mode: set a key change on any measure below to modulate from there on.")
 
             n = st.session_state[f"mcount_{sid}"]
             for row_start in range(0, n, 4):
@@ -729,6 +767,13 @@ with editor_col:
                             placeholder=("V7" if st.session_state["input_mode"] == "roman" else "E7"),
                             on_change=on_measure_text_change, args=(sid, i),
                         )
+                        if st.session_state["input_mode"] == "roman":
+                            st.session_state.setdefault(f"mkey_{sid}_{i}", NO_KEY_CHANGE)
+                            st.selectbox(
+                                f"key change m.{i}", options=KEY_CHANGE_OPTIONS,
+                                format_func=key_change_label, key=f"mkey_{sid}_{i}",
+                                label_visibility="collapsed",
+                            )
 
             with st.expander("Copy / paste"):
                 st.session_state[f"copyfrom_{sid}"] = min(st.session_state.get(f"copyfrom_{sid}", 1), n)
@@ -804,6 +849,7 @@ with editor_col:
 with preview_col:
     data = collect_data()
     _parse_mode = current_display_parse_mode()
+    _running_shift = 0  # persists across sections until a measure sets a new one
 
     parts = [f'<div class="chart-paper"><div class="chart-title">{html.escape(data["title"])}</div>']
     parts.append(f'<div class="chart-subtitle">{html.escape(data["subtitle"])}</div>')
@@ -821,15 +867,11 @@ with preview_col:
             header += f'<span class="section-name">{html.escape(sec["name"].upper())}</span>'
         if sec["repeats"] > 1:
             header += f'<span class="section-repeat-note">play ×{sec["repeats"]}</span>'
-        sec_key_shift = sec.get("key_shift", 0)
-        sec_effective_key = None
-        if data["input_mode"] == "roman" and sec_key_shift != 0:
-            sec_effective_key = shift_key(data.get("publish_key", "C"), sec_key_shift)
-            header += f'<span class="section-repeat-note">modulates to {sec_effective_key} ({sec_key_shift:+d})</span>'
         header += '<span class="section-hr"></span>'
         parts.append(f'<div class="section-header">{header}</div>')
 
         measures = sec["measures"]
+        key_changes = sec.get("key_changes", [None] * len(measures))
         n = len(measures)
         for row_start in range(0, n, 4):
             row = measures[row_start : row_start + 4]
@@ -850,11 +892,22 @@ with preview_col:
                         f'<div class="repeat-end"><span class="count">×{sec["repeats"]}</span>'
                         '<div class="dots"><span></span><span></span></div><div class="bar"></div></div>'
                     )
+                mod_key = None
+                if data["input_mode"] == "roman":
+                    kc = key_changes[gi] if gi < len(key_changes) else None
+                    if kc is not None:
+                        _running_shift = kc
+                        mod_key = shift_key(data.get("publish_key", "C"), _running_shift)
+                        marks += f'<div class="key-change">→ {mod_key} ({_running_shift:+d})</div>'
+                effective_key = (
+                    (data.get("publish_key", "C") if _running_shift == 0 else shift_key(data.get("publish_key", "C"), _running_shift))
+                    if data["input_mode"] == "roman" else None
+                )
                 parts.append(
                     f'<div class="measure-box" style="border-left:1.5px solid {INK};border-right:{border_right};'
                     f'padding-left:{pad_l}px;padding-right:{pad_r}px;">'
                     f'<span class="measure-index">{gi + 1}</span>'
-                    f'<span class="chord">{chord_html(resolve_display_text(text, sec_effective_key), _parse_mode)}</span>{marks}</div>'
+                    f'<span class="chord">{chord_html(resolve_display_text(text, effective_key), _parse_mode)}</span>{marks}</div>'
                 )
             parts.append("</div>")
         parts.append("</div>")
@@ -920,6 +973,7 @@ def build_pdf(data: dict, parse_mode: str) -> bytes:
 
     box_w = (width - 2 * margin) / 4
     box_h = 0.55 * inch
+    running_shift = 0  # persists across sections, same as the on-screen preview
 
     for sec in data["sections"]:
         if y < margin + box_h * 2:
@@ -931,17 +985,13 @@ def build_pdf(data: dict, parse_mode: str) -> bytes:
             label += "   " + sec["name"].upper()
         if sec["repeats"] > 1:
             label += f"   (play x{sec['repeats']})"
-        sec_key_shift = sec.get("key_shift", 0)
-        sec_effective_key = None
-        if data["input_mode"] == "roman" and sec_key_shift != 0:
-            sec_effective_key = shift_key(data.get("publish_key", "C"), sec_key_shift)
-            label += f"   (modulates to {sec_effective_key}, {sec_key_shift:+d} semitones)"
         c.drawString(x, y, label)
         y -= 6
         c.line(x, y, width - margin, y)
         y -= box_h
 
         measures = sec["measures"]
+        key_changes = sec.get("key_changes", [None] * len(measures))
         n = len(measures)
         for row_start in range(0, n, 4):
             if y < margin:
@@ -949,10 +999,23 @@ def build_pdf(data: dict, parse_mode: str) -> bytes:
                 y = height - margin
             row = measures[row_start : row_start + 4]
             for i, text in enumerate(row):
+                gi = row_start + i
                 bx = x + i * box_w
                 c.setLineWidth(1)
                 c.rect(bx, y, box_w, box_h)
-                render_chord_pdf(c, resolve_display_text(text, sec_effective_key), bx, y, box_w, box_h, parse_mode)
+                if data["input_mode"] == "roman":
+                    kc = key_changes[gi] if gi < len(key_changes) else None
+                    if kc is not None:
+                        running_shift = kc
+                        mod_key = shift_key(data.get("publish_key", "C"), running_shift)
+                        c.setFont("Helvetica-Bold", 7)
+                        c.setFillColorRGB(0.48, 0.18, 0.18)
+                        c.drawRightString(bx + box_w - 3, y + box_h - 9, f"\u2192 {mod_key} ({running_shift:+d})")
+                        c.setFillColorRGB(0, 0, 0)
+                    effective_key = data.get("publish_key", "C") if running_shift == 0 else shift_key(data.get("publish_key", "C"), running_shift)
+                else:
+                    effective_key = None
+                render_chord_pdf(c, resolve_display_text(text, effective_key), bx, y, box_w, box_h, parse_mode)
             if sec["repeats"] > 1:
                 is_first_row = row_start == 0
                 is_last_row = row_start + 4 >= n
