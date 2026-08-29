@@ -162,6 +162,89 @@ def on_measure_text_change(sid: int, idx: int):
 
 
 # --------------------------------------------------------------------------
+# Copy / paste — an in-app clipboard (session_state), since Streamlit has no
+# direct access to the system clipboard. Holds either a range of measures
+# or an entire section at a time.
+# --------------------------------------------------------------------------
+def copy_measures(sid: int, letter: str, start_1idx: int, end_1idx: int):
+    n = st.session_state[f"mcount_{sid}"]
+    start = max(1, min(start_1idx, n)) - 1
+    end = max(1, min(end_1idx, n))
+    if end <= start:
+        return
+    texts = [st.session_state.get(f"m_{sid}_{i}", "") for i in range(start, end)]
+    st.session_state["clipboard"] = {
+        "type": "measures",
+        "data": texts,
+        "desc": f"{len(texts)} measure{'s' if len(texts) != 1 else ''} from section {letter} (m.{start + 1}–{end})",
+    }
+
+
+def copy_section(sid: int, letter: str):
+    n = st.session_state[f"mcount_{sid}"]
+    st.session_state["clipboard"] = {
+        "type": "section",
+        "data": {
+            "name": st.session_state.get(f"name_{sid}", ""),
+            "repeats": st.session_state.get(f"repeats_{sid}", 1),
+            "measures": [st.session_state.get(f"m_{sid}_{i}", "") for i in range(n)],
+        },
+        "desc": f"section {letter} ({n} measures)",
+    }
+
+
+def paste_measures_into(sid: int, at_1idx: int):
+    clip = st.session_state.get("clipboard")
+    if not clip or clip["type"] != "measures":
+        return
+    texts = clip["data"]
+    n = st.session_state[f"mcount_{sid}"]
+    old = [st.session_state.get(f"m_{sid}_{i}", "") for i in range(n)]
+    at = max(0, min(at_1idx - 1, n))
+    new_list = (old[:at] + list(texts) + old[at:])[:64]
+    st.session_state[f"mcount_{sid}"] = len(new_list)
+    for i, v in enumerate(new_list):
+        st.session_state[f"m_{sid}_{i}"] = v
+
+
+def paste_section_after(after_sid):
+    clip = st.session_state.get("clipboard")
+    if not clip or clip["type"] != "section":
+        return
+    data = clip["data"]
+    new_sid = st.session_state["next_id"]
+    st.session_state["next_id"] += 1
+    st.session_state[f"name_{new_sid}"] = data["name"]
+    st.session_state[f"repeats_{new_sid}"] = data["repeats"]
+    measures = data["measures"]
+    st.session_state[f"mcount_{new_sid}"] = len(measures)
+    for i, v in enumerate(measures):
+        st.session_state[f"m_{new_sid}_{i}"] = v
+    order = st.session_state["section_order"]
+    if after_sid is None:
+        order.append(new_sid)
+    else:
+        order.insert(order.index(after_sid) + 1, new_sid)
+
+
+def replace_section(sid: int):
+    clip = st.session_state.get("clipboard")
+    if not clip or clip["type"] != "section":
+        return
+    data = clip["data"]
+    st.session_state[f"name_{sid}"] = data["name"]
+    st.session_state[f"repeats_{sid}"] = data["repeats"]
+    measures = data["measures"]
+    st.session_state[f"mcount_{sid}"] = len(measures)
+    for i, v in enumerate(measures):
+        st.session_state[f"m_{sid}_{i}"] = v
+
+
+def clear_clipboard():
+    st.session_state["clipboard"] = None
+
+
+# --------------------------------------------------------------------------
 # Initial state
 # --------------------------------------------------------------------------
 if "initialized" not in st.session_state:
@@ -170,6 +253,7 @@ if "initialized" not in st.session_state:
     st.session_state["subtitle"] = "Key of C · ♩ = 96"
     st.session_state["notes"] = ""
     st.session_state["save_status"] = "idle"
+    st.session_state["clipboard"] = None
     st.session_state["next_id"] = 2
     st.session_state["section_order"] = [1]
     st.session_state["name_1"] = ""
@@ -265,6 +349,14 @@ editor_col, preview_col = st.columns([2, 3])
 with editor_col:
     st.text_area("Notes", key="notes", placeholder="Tempo, feel, dynamics, performance notes…", height=80)
 
+    clip = st.session_state.get("clipboard")
+    if clip:
+        cc1, cc2 = st.columns([4, 1])
+        with cc1:
+            st.caption(f"📋 Copied: {clip['desc']}")
+        with cc2:
+            st.button("Clear", key="clear_clip", on_click=clear_clipboard, use_container_width=True)
+
     for idx, sid in enumerate(list(st.session_state["section_order"])):
         letter = chr(65 + idx)
         with st.container():
@@ -308,9 +400,77 @@ with editor_col:
                             f"measure {i}", key=f"m_{sid}_{i}", label_visibility="collapsed",
                             placeholder="V7", on_change=on_measure_text_change, args=(sid, i),
                         )
+
+            with st.expander("Copy / paste"):
+                st.session_state[f"copyfrom_{sid}"] = min(st.session_state.get(f"copyfrom_{sid}", 1), n)
+                st.session_state[f"copyto_{sid}"] = min(st.session_state.get(f"copyto_{sid}", n), n)
+                cp1, cp2, cp3 = st.columns([1, 1, 1.4])
+                with cp1:
+                    st.number_input("From m.", min_value=1, max_value=n, key=f"copyfrom_{sid}")
+                with cp2:
+                    st.number_input("To m.", min_value=1, max_value=n, key=f"copyto_{sid}")
+                with cp3:
+                    st.write("")
+                    st.button(
+                        "Copy measures",
+                        key=f"copymeasures_{sid}",
+                        use_container_width=True,
+                        on_click=copy_measures,
+                        args=(sid, letter, st.session_state[f"copyfrom_{sid}"], st.session_state[f"copyto_{sid}"]),
+                    )
+                st.button(
+                    "Copy whole section",
+                    key=f"copysection_{sid}",
+                    use_container_width=True,
+                    on_click=copy_section,
+                    args=(sid, letter),
+                )
+
+                clip = st.session_state.get("clipboard")
+                if clip and clip["type"] == "measures":
+                    st.session_state[f"pasteat_{sid}"] = min(st.session_state.get(f"pasteat_{sid}", n + 1), n + 1)
+                    pp1, pp2 = st.columns([1, 1.4])
+                    with pp1:
+                        st.number_input("Insert before m.", min_value=1, max_value=n + 1, key=f"pasteat_{sid}")
+                    with pp2:
+                        st.write("")
+                        st.button(
+                            "Paste measures",
+                            key=f"pastemeasures_{sid}",
+                            use_container_width=True,
+                            on_click=paste_measures_into,
+                            args=(sid, st.session_state[f"pasteat_{sid}"]),
+                        )
+                elif clip and clip["type"] == "section":
+                    pp1, pp2 = st.columns(2)
+                    with pp1:
+                        st.button(
+                            "Paste as new section after",
+                            key=f"pasteafter_{sid}",
+                            use_container_width=True,
+                            on_click=paste_section_after,
+                            args=(sid,),
+                        )
+                    with pp2:
+                        st.button(
+                            "Replace this section",
+                            key=f"pastereplace_{sid}",
+                            use_container_width=True,
+                            on_click=replace_section,
+                            args=(sid,),
+                        )
+
             st.markdown("</div>", unsafe_allow_html=True)
 
     st.button("＋ Add section", on_click=new_section, use_container_width=True)
+    clip = st.session_state.get("clipboard")
+    if clip and clip["type"] == "section":
+        st.button(
+            "＋ Paste as new section",
+            on_click=paste_section_after,
+            args=(None,),
+            use_container_width=True,
+        )
 
 with preview_col:
     data = collect_data()
