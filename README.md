@@ -29,11 +29,12 @@ exported PDF:
   typed) or as **chord names in a key you pick**. Handles triads, seventh
   chords, standard inversions (6, 6/4, 6/5, 4/3, 4/2), and one level of
   secondary dominant (e.g. `V7/V`). Anything unusual is shown as typed
-  rather than guessed at. Each section also has a **Key change (semitones
-  from original key)** field — set it to modulate that section (e.g. `+3`
-  shifts the section's effective key up a minor third for chord-name
-  purposes); a note like "modulates to Eb (+3)" appears in the chart so the
-  modulation is visible whether you're viewing Roman numerals or chord names.
+  rather than guessed at. Any measure can carry a **key change**, a
+  semitone shift from ±0 to ±6 relative to your chart's original key. Once
+  set, it takes effect for that measure and every later measure — across
+  section boundaries — until a different measure sets a new key change. A
+  small "→ Eb (+3)" label marks the exact measure where each modulation
+  starts, in both the on-screen chart and the PDF.
 - **Written as chord names** → set the key the chart is written in and the
   key you want to publish in; the app transposes every chord (including
   slash-chord bass notes) automatically. Diatonic chords transpose exactly;
