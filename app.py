@@ -44,6 +44,10 @@ def collect_data() -> dict:
         "title": st.session_state.get("title", "Untitled Chart"),
         "subtitle": st.session_state.get("subtitle", ""),
         "notes": st.session_state.get("notes", ""),
+        "input_mode": st.session_state.get("input_mode", "roman"),
+        "publish_display": st.session_state.get("publish_display", "Roman numerals"),
+        "written_key": st.session_state.get("written_key", "C"),
+        "publish_key": st.session_state.get("publish_key", "C"),
         "sections": sections,
     }
 
@@ -71,6 +75,10 @@ def load_from_disk():
     st.session_state["title"] = data.get("title", "Untitled Chart")
     st.session_state["subtitle"] = data.get("subtitle", "")
     st.session_state["notes"] = data.get("notes", "")
+    st.session_state["input_mode"] = data.get("input_mode", "roman")
+    st.session_state["publish_display"] = data.get("publish_display", "Roman numerals")
+    st.session_state["written_key"] = data.get("written_key", "C")
+    st.session_state["publish_key"] = data.get("publish_key", "C")
 
     order = []
     max_id = 0
@@ -91,35 +99,280 @@ def load_from_disk():
 
 
 # --------------------------------------------------------------------------
-# Chord parsing — "-7b5" always becomes "ø"; everything after the roman
-# numeral is superscripted automatically (no markup needed).
+# Chord parsing & music theory
+#
+#   "-7b5"  always becomes "ø"      (half-diminished)
+#   "^"     always becomes "Δ"      (major seventh) — NOT a separator
+#
+# Everything after the root (roman numeral or note letter) is superscripted
+# automatically, except a "/xyz" tail that names another chord/key/note
+# (secondary dominants, slash-bass chords) — that stays normal-sized.
 # --------------------------------------------------------------------------
+NOTE_TO_SEMITONE = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+LETTERS = "CDEFGAB"
+MAJOR_INTERVALS = [0, 2, 4, 5, 7, 9, 11]  # semitones of scale degrees 1..7
+FLAT_KEYS = {"F", "Bb", "Eb", "Ab", "Db", "Gb", "Cb"}
+MAJOR_KEYS = ["C", "G", "D", "A", "E", "B", "F#", "C#", "F", "Bb", "Eb", "Ab", "Db", "Gb", "Cb"]
+
+ROMAN_TO_DEGREE = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7}
+_ROMAN_PATTERN = re.compile(r"^([#b]*)(VII|vii|III|iii|VI|vi|IV|iv|II|ii|V|v|I|i)")
+
+
 def apply_chord_shorthand(text: str) -> str:
-    return text.replace("-7b5", "ø")
+    text = text.replace("-7b5", "ø")
+    text = text.replace("^", "Δ")
+    return text
 
 
-def parse_chord_token(token: str):
-    if "^" in token:  # kept for backward compatibility with older charts
-        i = token.index("^")
-        return token[:i], token[i + 1 :]
-    m = re.match(r"^[#b]*[nNivxIVX]+", token)
+def split_slash_suffix(rest: str):
+    """Separate a trailing '/something' from the superscriptable part.
+    A '/' followed by a digit is a figured-bass inversion (e.g. 6/4) and
+    stays fully superscripted; a '/' followed by a letter names another
+    chord/note (secondary dominant, slash-bass) and is kept normal-sized."""
+    if "/" not in rest:
+        return rest, ""
+    idx = rest.index("/")
+    after = rest[idx + 1 :]
+    if after[:1].isdigit():
+        return rest, ""
+    return rest[:idx], rest[idx:]
+
+
+def parse_chord_token(token: str, mode: str):
+    if mode == "roman":
+        m = re.match(r"^[#b]*[nNivxIVX]+", token)
+    else:
+        m = re.match(r"^[A-Ga-g][#b]?", token)
     if not m or len(m.group(0)) == 0 or len(m.group(0)) == len(token):
-        return token, ""
-    return m.group(0), token[len(m.group(0)) :]
+        base, rest = token, ""
+    else:
+        base, rest = m.group(0), token[len(m.group(0)) :]
+    sup, slash = split_slash_suffix(rest)
+    return base, sup, slash
 
 
-def chord_html(text: str) -> str:
+def chord_html(text: str, mode: str) -> str:
     if not text or not text.strip():
         return ""
     pieces = []
     for tok in text.strip().split():
-        base, sup = parse_chord_token(tok)
-        base, sup = html.escape(base), html.escape(sup)
+        base, sup, slash = parse_chord_token(tok, mode)
+        base, sup, slash = html.escape(base), html.escape(sup), html.escape(slash)
+        piece = f"<span>{base}</span>"
         if sup:
-            pieces.append(f'<span class="chord-token">{base}<sup>{sup}</sup></span>')
-        else:
-            pieces.append(f'<span class="chord-token">{base}</span>')
+            piece += f"<sup>{sup}</sup>"
+        if slash:
+            piece += f"<span>{slash}</span>"
+        pieces.append(f'<span class="chord-token">{piece}</span>')
     return "".join(pieces)
+
+
+# ---- note spelling helpers ------------------------------------------------
+def note_semitone(note: str) -> int:
+    letter = note[0].upper()
+    acc = note[1:]
+    return (NOTE_TO_SEMITONE[letter] + acc.count("#") - acc.count("b")) % 12
+
+
+def spell_letter(letter: str, semitone: int) -> str:
+    natural = NOTE_TO_SEMITONE[letter]
+    diff = (semitone - natural) % 12
+    if diff > 6:
+        diff -= 12
+    if diff == 0:
+        return letter
+    return letter + ("#" * diff if diff > 0 else "b" * (-diff))
+
+
+def respell(semitone: int, prefer_flat: bool) -> str:
+    best = None
+    for L in LETTERS:
+        diff = (semitone - NOTE_TO_SEMITONE[L]) % 12
+        if diff > 6:
+            diff -= 12
+        cand = (abs(diff), L, diff)
+        if best is None or cand[0] < best[0] or (
+            cand[0] == best[0] and ((prefer_flat and cand[2] < best[2]) or (not prefer_flat and cand[2] > best[2]))
+        ):
+            best = cand
+    _, L, diff = best
+    return spell_letter(L, (NOTE_TO_SEMITONE[L] + diff) % 12)
+
+
+def major_scale(tonic: str):
+    letter = tonic[0].upper()
+    acc = tonic[1:]
+    tonic_semitone = note_semitone(letter + acc)
+    start = LETTERS.index(letter)
+    scale_letters = [LETTERS[(start + i) % 7] for i in range(7)]
+    return [spell_letter(scale_letters[i], (tonic_semitone + MAJOR_INTERVALS[i]) % 12) for i in range(7)]
+
+
+# ---- roman numeral -> chord name -------------------------------------------
+def parse_roman_root(token: str):
+    m = _ROMAN_PATTERN.match(token)
+    if not m:
+        return None
+    prefix, numeral = m.group(1), m.group(2)
+    shift = prefix.count("#") - prefix.count("b")
+    degree = ROMAN_TO_DEGREE[numeral.upper()]
+    is_upper = numeral[0].isupper()
+    return shift, degree, is_upper, len(m.group(0))
+
+
+_FIGURE_INFO = {"": (0, False), "6": (1, False), "6/4": (2, False), "7": (0, True),
+                "6/5": (1, True), "4/3": (2, True), "4/2": (3, True), "2": (3, True)}
+
+
+def resolve_figure(fig: str):
+    """Returns (bass_index, has_seventh, seventh_kind, unrecognized_tail)."""
+    if fig.startswith("Δ"):
+        return 0, True, "maj7", fig[1:]
+    if fig.lower().startswith("maj"):
+        tail = fig[3:]
+        return 0, True, "maj7", (tail[1:] if tail[:1] == "7" else tail)
+    info = _FIGURE_INFO.get(fig)
+    if info is not None:
+        return info[0], info[1], None, ""
+    return 0, False, None, fig  # unrecognized: root position, appended literally
+
+
+def quality_to_suffix(quality: str, has7: bool, seventh_kind: str) -> str:
+    if quality == "major":
+        if not has7:
+            return ""
+        return "maj7" if seventh_kind == "maj7" else "7"
+    if quality == "minor":
+        if not has7:
+            return "m"
+        return "m(maj7)" if seventh_kind == "maj7" else "m7"
+    if quality == "dim":
+        return "°7" if has7 else "°"
+    if quality == "halfdim":
+        return "ø7" if has7 else "ø"
+    if quality == "aug":
+        return "+7" if has7 else "+"
+    return ""
+
+
+def seventh_interval(quality: str, seventh_kind: str) -> int:
+    if seventh_kind == "maj7":
+        return 11
+    if quality == "dim":
+        return 9
+    return 10  # dominant / minor / half-diminished seventh
+
+
+def roman_to_chord_name(token: str, key: str) -> str:
+    try:
+        parsed = parse_roman_root(token)
+        if parsed is None:
+            return token
+        shift, degree, is_upper, consumed = parsed
+        rest = token[consumed:]
+
+        target_shift = target_degree = None
+        if "/" in rest:
+            idx = rest.index("/")
+            after = rest[idx + 1 :]
+            tgt = parse_roman_root(after)
+            if tgt is not None and tgt[3] == len(after):
+                target_shift, target_degree = tgt[0], tgt[1]
+                rest = rest[:idx]
+
+        quality = "major" if is_upper else "minor"
+        if rest.startswith("°"):
+            quality, rest = "dim", rest[1:]
+        elif rest.startswith("ø"):
+            quality, rest = "halfdim", rest[1:]
+        elif rest.startswith("+"):
+            quality, rest = "aug", rest[1:]
+
+        scale = major_scale(key)
+        if target_degree is not None:
+            t_letter = scale[target_degree - 1][0]
+            t_semitone = (note_semitone(scale[target_degree - 1]) + target_shift) % 12
+            letter = LETTERS[(LETTERS.index(t_letter) + (degree - 1)) % 7]
+            root_semitone = (t_semitone + MAJOR_INTERVALS[degree - 1] + shift) % 12
+        else:
+            letter = scale[degree - 1][0]
+            root_semitone = (note_semitone(scale[degree - 1]) + shift) % 12
+        root_spelled = spell_letter(letter, root_semitone)
+
+        bass_index, has7, seventh_kind, tail = resolve_figure(rest)
+        if quality == "halfdim":
+            has7, seventh_kind = True, "min7"
+
+        base_ivals = {"major": [0, 4, 7], "minor": [0, 3, 7], "dim": [0, 3, 6],
+                      "aug": [0, 4, 8], "halfdim": [0, 3, 6]}[quality]
+        ivals = list(base_ivals)
+        if has7:
+            ivals.append(seventh_interval(quality, seventh_kind))
+        bass_index = min(bass_index, len(ivals) - 1)
+        bass_semitone = (root_semitone + ivals[bass_index]) % 12
+        bass_letter = LETTERS[(LETTERS.index(letter) + 2 * bass_index) % 7]
+        bass_spelled = spell_letter(bass_letter, bass_semitone)
+
+        chord_str = root_spelled + quality_to_suffix(quality, has7, seventh_kind) + tail
+        if bass_index != 0:
+            chord_str += "/" + bass_spelled
+        return chord_str
+    except Exception:
+        return token  # anything we can't confidently parse is shown as-is
+
+
+# ---- chord-name transposition ----------------------------------------------
+def transpose_note(note: str, from_key: str, to_key: str) -> str:
+    scale_from = major_scale(from_key)
+    if note in scale_from:
+        return major_scale(to_key)[scale_from.index(note)]
+    shift = (note_semitone(to_key) - note_semitone(from_key)) % 12
+    target_semitone = (note_semitone(note) + shift) % 12
+    return respell(target_semitone, to_key in FLAT_KEYS)
+
+
+def transpose_chord_token(token: str, from_key: str, to_key: str) -> str:
+    if from_key == to_key:
+        return token
+    try:
+        m = re.match(r"^[A-Ga-g][#b]?", token)
+        if not m:
+            return token
+        root, rest = m.group(0), token[len(m.group(0)) :]
+        new_root = transpose_note(root, from_key, to_key)
+        if "/" in rest:
+            idx = rest.index("/")
+            pre, bass_part = rest[:idx], rest[idx + 1 :]
+            bm = re.match(r"^[A-Ga-g][#b]?", bass_part)
+            if bm:
+                new_bass = transpose_note(bm.group(0), from_key, to_key)
+                rest = pre + "/" + new_bass + bass_part[len(bm.group(0)) :]
+        return new_root + rest
+    except Exception:
+        return token
+
+
+# ---- what to actually display, given the current mode/publish settings ----
+def current_display_parse_mode() -> str:
+    if st.session_state["input_mode"] == "roman" and st.session_state.get("publish_display") == "Roman numerals":
+        return "roman"
+    return "name"
+
+
+def resolve_display_text(raw_text: str) -> str:
+    if not raw_text or not raw_text.strip():
+        return raw_text
+    mode = st.session_state["input_mode"]
+    out = []
+    for tok in raw_text.strip().split():
+        if mode == "roman" and st.session_state.get("publish_display") == "Chord names":
+            out.append(roman_to_chord_name(tok, st.session_state.get("publish_key", "C")))
+        elif mode == "name":
+            wk, pk = st.session_state.get("written_key", "C"), st.session_state.get("publish_key", "C")
+            out.append(transpose_chord_token(tok, wk, pk))
+        else:
+            out.append(tok)
+    return " ".join(out)
 
 
 # --------------------------------------------------------------------------
@@ -252,6 +505,10 @@ if "initialized" not in st.session_state:
     st.session_state["title"] = "Untitled Chart"
     st.session_state["subtitle"] = "Key of C · ♩ = 96"
     st.session_state["notes"] = ""
+    st.session_state["input_mode"] = "roman"
+    st.session_state["publish_display"] = "Roman numerals"
+    st.session_state["written_key"] = "C"
+    st.session_state["publish_key"] = "C"
     st.session_state["save_status"] = "idle"
     st.session_state["clipboard"] = None
     st.session_state["next_id"] = 2
@@ -342,6 +599,53 @@ with col_actions:
         pdf_placeholder = st.container()
 
 # --------------------------------------------------------------------------
+# Input mode + publish/transpose settings
+# --------------------------------------------------------------------------
+with st.expander("Input mode & publish settings", expanded=False):
+    mode_col, settings_col = st.columns([1, 2])
+    with mode_col:
+        mode_label = st.radio(
+            "Enter chords as",
+            ["Roman numerals", "Chord names"],
+            index=0 if st.session_state["input_mode"] == "roman" else 1,
+            key="input_mode_radio",
+        )
+        st.session_state["input_mode"] = "roman" if mode_label == "Roman numerals" else "name"
+        if st.session_state["input_mode"] == "roman":
+            st.caption(
+                "e.g. V7, ii6, vii°7, V7/V — type the numeral then anything else; "
+                "it's superscripted automatically. \"^\" always means major 7th (Δ)."
+            )
+        else:
+            st.caption(
+                "e.g. E7, Ab^ (= Ab major 7), Dm7, C/E — type the root then anything else; "
+                "it's superscripted automatically. \"^\" always means major 7th (Δ)."
+            )
+
+    with settings_col:
+        if st.session_state["input_mode"] == "roman":
+            st.radio(
+                "Publish chart as",
+                ["Roman numerals", "Chord names"],
+                key="publish_display",
+                horizontal=True,
+            )
+            if st.session_state["publish_display"] == "Chord names":
+                st.selectbox("Key for chord names", MAJOR_KEYS, key="publish_key")
+                st.caption(
+                    "Converts triads, seventh chords, standard inversions (6, 6/4, 6/5, 4/3, 4/2), "
+                    "and one level of secondary dominant (e.g. V7/V). Anything else is shown as typed."
+                )
+        else:
+            k1, k2 = st.columns(2)
+            with k1:
+                st.selectbox("Chart is written in", MAJOR_KEYS, key="written_key")
+            with k2:
+                st.selectbox("Publish in key", MAJOR_KEYS, key="publish_key")
+            if st.session_state["written_key"] != st.session_state["publish_key"]:
+                st.caption(f"Transposing from {st.session_state['written_key']} to {st.session_state['publish_key']}.")
+
+# --------------------------------------------------------------------------
 # Editor + preview
 # --------------------------------------------------------------------------
 editor_col, preview_col = st.columns([2, 3])
@@ -398,7 +702,8 @@ with editor_col:
                         st.caption(f"m.{i + 1}")
                         st.text_input(
                             f"measure {i}", key=f"m_{sid}_{i}", label_visibility="collapsed",
-                            placeholder="V7", on_change=on_measure_text_change, args=(sid, i),
+                            placeholder=("V7" if st.session_state["input_mode"] == "roman" else "E7"),
+                            on_change=on_measure_text_change, args=(sid, i),
                         )
 
             with st.expander("Copy / paste"):
@@ -474,6 +779,7 @@ with editor_col:
 
 with preview_col:
     data = collect_data()
+    _parse_mode = current_display_parse_mode()
 
     parts = [f'<div class="chart-paper"><div class="chart-title">{html.escape(data["title"])}</div>']
     parts.append(f'<div class="chart-subtitle">{html.escape(data["subtitle"])}</div>')
@@ -519,7 +825,7 @@ with preview_col:
                     f'<div class="measure-box" style="border-left:1.5px solid {INK};border-right:{border_right};'
                     f'padding-left:{pad_l}px;padding-right:{pad_r}px;">'
                     f'<span class="measure-index">{gi + 1}</span>'
-                    f'<span class="chord">{chord_html(text)}</span>{marks}</div>'
+                    f'<span class="chord">{chord_html(resolve_display_text(text), _parse_mode)}</span>{marks}</div>'
                 )
             parts.append("</div>")
         parts.append("</div>")
@@ -531,21 +837,23 @@ with preview_col:
 # PDF export (this replaces the browser print button — it always works
 # because the file is generated in Python, not via the browser)
 # --------------------------------------------------------------------------
-def render_chord_pdf(c: canvas.Canvas, text: str, bx: float, by: float, bw: float, bh: float):
+def render_chord_pdf(c: canvas.Canvas, text: str, bx: float, by: float, bw: float, bh: float, mode: str):
     if not text or not text.strip():
         return
-    pieces = [parse_chord_token(tok) for tok in text.strip().split()]
+    pieces = [parse_chord_token(tok, mode) for tok in text.strip().split()]
     base_font, sup_font, base_size, sup_size = "Times-Italic", "Times-Italic", 13, 8
     seg_widths = []
-    for base, sup in pieces:
+    for base, sup, slash in pieces:
         w = stringWidth(base, base_font, base_size)
         if sup:
             w += stringWidth(sup, sup_font, sup_size) + 1
+        if slash:
+            w += stringWidth(slash, base_font, base_size)
         seg_widths.append(w)
     total = sum(seg_widths) + 8 * max(0, len(pieces) - 1)
     curx = bx + bw / 2 - total / 2
     cy = by + bh / 2 - 4
-    for (base, sup), w in zip(pieces, seg_widths):
+    for (base, sup, slash), w in zip(pieces, seg_widths):
         c.setFont(base_font, base_size)
         c.drawString(curx, cy, base)
         curx += stringWidth(base, base_font, base_size)
@@ -553,10 +861,14 @@ def render_chord_pdf(c: canvas.Canvas, text: str, bx: float, by: float, bw: floa
             c.setFont(sup_font, sup_size)
             c.drawString(curx + 1, cy + 6, sup)
             curx += stringWidth(sup, sup_font, sup_size) + 1
+        if slash:
+            c.setFont(base_font, base_size)
+            c.drawString(curx, cy, slash)
+            curx += stringWidth(slash, base_font, base_size)
         curx += 8
 
 
-def build_pdf(data: dict) -> bytes:
+def build_pdf(data: dict, parse_mode: str) -> bytes:
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=LETTER_SIZE)
     width, height = LETTER_SIZE
@@ -606,7 +918,7 @@ def build_pdf(data: dict) -> bytes:
                 bx = x + i * box_w
                 c.setLineWidth(1)
                 c.rect(bx, y, box_w, box_h)
-                render_chord_pdf(c, text, bx, y, box_w, box_h)
+                render_chord_pdf(c, resolve_display_text(text), bx, y, box_w, box_h, parse_mode)
             if sec["repeats"] > 1:
                 is_first_row = row_start == 0
                 is_last_row = row_start + 4 >= n
@@ -635,7 +947,7 @@ def build_pdf(data: dict) -> bytes:
 with pdf_placeholder:
     st.download_button(
         "⬇ PDF",
-        data=build_pdf(data),
+        data=build_pdf(data, _parse_mode),
         file_name=f"{(data['title'] or 'chord-chart').strip().replace(' ', '-')}.pdf",
         mime="application/pdf",
         use_container_width=True,
