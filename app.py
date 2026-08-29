@@ -37,6 +37,7 @@ def collect_data() -> dict:
                 "name": st.session_state.get(f"name_{sid}", ""),
                 "measure_count": n,
                 "repeats": st.session_state.get(f"repeats_{sid}", 1),
+                "key_shift": st.session_state.get(f"keyshift_{sid}", 0),
                 "measures": [st.session_state.get(f"m_{sid}_{i}", "") for i in range(n)],
             }
         )
@@ -88,6 +89,7 @@ def load_from_disk():
         order.append(sid)
         st.session_state[f"name_{sid}"] = sec.get("name", "")
         st.session_state[f"repeats_{sid}"] = sec.get("repeats", 1)
+        st.session_state[f"keyshift_{sid}"] = sec.get("key_shift", 0)
         measures = sec.get("measures", [])
         mc = sec.get("measure_count", len(measures) or 8)
         st.session_state[f"mcount_{sid}"] = mc
@@ -113,6 +115,8 @@ LETTERS = "CDEFGAB"
 MAJOR_INTERVALS = [0, 2, 4, 5, 7, 9, 11]  # semitones of scale degrees 1..7
 FLAT_KEYS = {"F", "Bb", "Eb", "Ab", "Db", "Gb", "Cb"}
 MAJOR_KEYS = ["C", "G", "D", "A", "E", "B", "F#", "C#", "F", "Bb", "Eb", "Ab", "Db", "Gb", "Cb"]
+# Conventional single spelling per pitch class, used to name a modulation target.
+KEY_BY_SEMITONE = ["C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 
 ROMAN_TO_DEGREE = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7}
 _ROMAN_PATTERN = re.compile(r"^([#b]*)(VII|vii|III|iii|VI|vi|IV|iv|II|ii|V|v|I|i)")
@@ -206,6 +210,10 @@ def major_scale(tonic: str):
     start = LETTERS.index(letter)
     scale_letters = [LETTERS[(start + i) % 7] for i in range(7)]
     return [spell_letter(scale_letters[i], (tonic_semitone + MAJOR_INTERVALS[i]) % 12) for i in range(7)]
+
+
+def shift_key(base_key: str, semitones: int) -> str:
+    return KEY_BY_SEMITONE[(note_semitone(base_key) + semitones) % 12]
 
 
 # ---- roman numeral -> chord name -------------------------------------------
@@ -359,14 +367,15 @@ def current_display_parse_mode() -> str:
     return "name"
 
 
-def resolve_display_text(raw_text: str) -> str:
+def resolve_display_text(raw_text: str, roman_key: str = None) -> str:
     if not raw_text or not raw_text.strip():
         return raw_text
     mode = st.session_state["input_mode"]
     out = []
     for tok in raw_text.strip().split():
         if mode == "roman" and st.session_state.get("publish_display") == "Chord names":
-            out.append(roman_to_chord_name(tok, st.session_state.get("publish_key", "C")))
+            key = roman_key if roman_key is not None else st.session_state.get("publish_key", "C")
+            out.append(roman_to_chord_name(tok, key))
         elif mode == "name":
             wk, pk = st.session_state.get("written_key", "C"), st.session_state.get("publish_key", "C")
             out.append(transpose_chord_token(tok, wk, pk))
@@ -384,6 +393,7 @@ def new_section(measure_count: int = 8):
     st.session_state["section_order"].append(sid)
     st.session_state[f"name_{sid}"] = ""
     st.session_state[f"repeats_{sid}"] = 1
+    st.session_state[f"keyshift_{sid}"] = 0
     st.session_state[f"mcount_{sid}"] = measure_count
     for i in range(measure_count):
         st.session_state[f"m_{sid}_{i}"] = ""
@@ -440,6 +450,7 @@ def copy_section(sid: int, letter: str):
         "data": {
             "name": st.session_state.get(f"name_{sid}", ""),
             "repeats": st.session_state.get(f"repeats_{sid}", 1),
+            "key_shift": st.session_state.get(f"keyshift_{sid}", 0),
             "measures": [st.session_state.get(f"m_{sid}_{i}", "") for i in range(n)],
         },
         "desc": f"section {letter} ({n} measures)",
@@ -469,6 +480,7 @@ def paste_section_after(after_sid):
     st.session_state["next_id"] += 1
     st.session_state[f"name_{new_sid}"] = data["name"]
     st.session_state[f"repeats_{new_sid}"] = data["repeats"]
+    st.session_state[f"keyshift_{new_sid}"] = data.get("key_shift", 0)
     measures = data["measures"]
     st.session_state[f"mcount_{new_sid}"] = len(measures)
     for i, v in enumerate(measures):
@@ -487,6 +499,7 @@ def replace_section(sid: int):
     data = clip["data"]
     st.session_state[f"name_{sid}"] = data["name"]
     st.session_state[f"repeats_{sid}"] = data["repeats"]
+    st.session_state[f"keyshift_{sid}"] = data.get("key_shift", 0)
     measures = data["measures"]
     st.session_state[f"mcount_{sid}"] = len(measures)
     for i, v in enumerate(measures):
@@ -515,6 +528,7 @@ if "initialized" not in st.session_state:
     st.session_state["section_order"] = [1]
     st.session_state["name_1"] = ""
     st.session_state["repeats_1"] = 1
+    st.session_state["keyshift_1"] = 0
     st.session_state["mcount_1"] = 8
     for i in range(8):
         st.session_state[f"m_1_{i}"] = ""
@@ -691,6 +705,16 @@ with editor_col:
             with m2:
                 st.number_input("Repeat ×", min_value=1, max_value=20, key=f"repeats_{sid}")
 
+            if st.session_state["input_mode"] == "roman":
+                st.number_input(
+                    "Key change (semitones from original key)",
+                    min_value=-24, max_value=24, step=1, key=f"keyshift_{sid}",
+                )
+                shift = st.session_state[f"keyshift_{sid}"]
+                if shift != 0:
+                    eff_key = shift_key(st.session_state.get("publish_key", "C"), shift)
+                    st.caption(f"This section modulates to {eff_key} ({shift:+d} semitones)")
+
             n = st.session_state[f"mcount_{sid}"]
             for row_start in range(0, n, 4):
                 cols = st.columns(4)
@@ -797,6 +821,11 @@ with preview_col:
             header += f'<span class="section-name">{html.escape(sec["name"].upper())}</span>'
         if sec["repeats"] > 1:
             header += f'<span class="section-repeat-note">play ×{sec["repeats"]}</span>'
+        sec_key_shift = sec.get("key_shift", 0)
+        sec_effective_key = None
+        if data["input_mode"] == "roman" and sec_key_shift != 0:
+            sec_effective_key = shift_key(data.get("publish_key", "C"), sec_key_shift)
+            header += f'<span class="section-repeat-note">modulates to {sec_effective_key} ({sec_key_shift:+d})</span>'
         header += '<span class="section-hr"></span>'
         parts.append(f'<div class="section-header">{header}</div>')
 
@@ -825,7 +854,7 @@ with preview_col:
                     f'<div class="measure-box" style="border-left:1.5px solid {INK};border-right:{border_right};'
                     f'padding-left:{pad_l}px;padding-right:{pad_r}px;">'
                     f'<span class="measure-index">{gi + 1}</span>'
-                    f'<span class="chord">{chord_html(resolve_display_text(text), _parse_mode)}</span>{marks}</div>'
+                    f'<span class="chord">{chord_html(resolve_display_text(text, sec_effective_key), _parse_mode)}</span>{marks}</div>'
                 )
             parts.append("</div>")
         parts.append("</div>")
@@ -902,6 +931,11 @@ def build_pdf(data: dict, parse_mode: str) -> bytes:
             label += "   " + sec["name"].upper()
         if sec["repeats"] > 1:
             label += f"   (play x{sec['repeats']})"
+        sec_key_shift = sec.get("key_shift", 0)
+        sec_effective_key = None
+        if data["input_mode"] == "roman" and sec_key_shift != 0:
+            sec_effective_key = shift_key(data.get("publish_key", "C"), sec_key_shift)
+            label += f"   (modulates to {sec_effective_key}, {sec_key_shift:+d} semitones)"
         c.drawString(x, y, label)
         y -= 6
         c.line(x, y, width - margin, y)
@@ -918,7 +952,7 @@ def build_pdf(data: dict, parse_mode: str) -> bytes:
                 bx = x + i * box_w
                 c.setLineWidth(1)
                 c.rect(bx, y, box_w, box_h)
-                render_chord_pdf(c, resolve_display_text(text), bx, y, box_w, box_h, parse_mode)
+                render_chord_pdf(c, resolve_display_text(text, sec_effective_key), bx, y, box_w, box_h, parse_mode)
             if sec["repeats"] > 1:
                 is_first_row = row_start == 0
                 is_last_row = row_start + 4 >= n
