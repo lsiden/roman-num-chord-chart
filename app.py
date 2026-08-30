@@ -20,10 +20,19 @@ from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas
 
 # --------------------------------------------------------------------------
-# Persistence — a plain JSON file next to this script. No browser storage,
-# no JavaScript permissions required, so it always works.
+# Persistence
+#
+# Two independent layers:
+#   1. Autosave — a fixed JSON file next to this script, written after every
+#      edit, restored automatically on startup (chord_chart_save.json).
+#   2. Named files — charts you explicitly save under a name and folder you
+#      choose, with a ".chord" extension by default, and can reload later.
+#
+# Both are plain files on the disk of the machine running this script — no
+# browser storage, no JavaScript permissions required.
 # --------------------------------------------------------------------------
 DATA_FILE = Path(__file__).parent / "chord_chart_save.json"
+DEFAULT_CHART_FOLDER = Path(__file__).parent / "charts"
 
 
 def collect_data() -> dict:
@@ -65,14 +74,8 @@ def save_to_disk():
         st.session_state["save_error"] = str(e)
 
 
-def load_from_disk():
-    if not DATA_FILE.exists():
-        return
-    try:
-        data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return  # corrupted or unreadable — keep the defaults already in session_state
-
+def apply_chart_data(data: dict):
+    """Load a chart dict (however it was read) into session_state."""
     st.session_state["title"] = data.get("title", "Untitled Chart")
     st.session_state["subtitle"] = data.get("subtitle", "")
     st.session_state["notes"] = data.get("notes", "")
@@ -106,6 +109,60 @@ def load_from_disk():
     if order:
         st.session_state["section_order"] = order
         st.session_state["next_id"] = max_id + 1
+
+
+def load_from_disk():
+    if not DATA_FILE.exists():
+        return
+    try:
+        data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return  # corrupted or unreadable — keep the defaults already in session_state
+    apply_chart_data(data)
+
+
+def sanitize_filename(name: str) -> str:
+    name = re.sub(r'[^A-Za-z0-9 _-]', "", (name or "")).strip()
+    return name or "chart"
+
+
+def resolved_chart_path(folder: str, filename: str) -> Path:
+    fname = filename.strip() or "chart"
+    if "." not in fname:
+        fname += ".chord"
+    return Path(folder).expanduser() / fname
+
+
+def list_chart_files(folder: str):
+    try:
+        folder_path = Path(folder).expanduser()
+        if not folder_path.exists():
+            return []
+        return sorted(p.name for p in folder_path.glob("*.chord"))
+    except Exception:
+        return []
+
+
+def save_chart_to_file(folder: str, filename: str):
+    try:
+        path = resolved_chart_path(folder, filename)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(collect_data(), ensure_ascii=False, indent=2), encoding="utf-8")
+        st.session_state["file_save_status"] = ("ok", str(path))
+    except Exception as e:
+        st.session_state["file_save_status"] = ("error", str(e))
+
+
+def load_chart_from_path(path_str: str):
+    try:
+        path = Path(path_str).expanduser()
+        data = json.loads(path.read_text(encoding="utf-8"))
+        apply_chart_data(data)
+        st.session_state["file_load_status"] = ("ok", str(path))
+    except Exception as e:
+        st.session_state["file_load_status"] = ("error", str(e))
+
+
 
 
 # --------------------------------------------------------------------------
@@ -567,6 +624,8 @@ if "initialized" not in st.session_state:
     st.session_state["written_key"] = "C"
     st.session_state["publish_key"] = "C"
     st.session_state["show_key_change_controls"] = True
+    st.session_state["file_folder"] = str(DEFAULT_CHART_FOLDER)
+    st.session_state["file_name"] = sanitize_filename(st.session_state["title"])
     st.session_state["save_status"] = "idle"
     st.session_state["clipboard"] = None
     st.session_state["next_id"] = 2
@@ -591,7 +650,7 @@ st.markdown(
     <style>
     @import url('https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,500;0,600;1,500;1,600&family=JetBrains+Mono:wght@400;500;600&display=swap');
     .stApp {{ background: {PAPER}; }}
-    .block-container {{ padding-top: 2rem; max-width: 1200px; }}
+    .block-container {{ padding-top: calc(2rem + 0.5in); max-width: 1200px; }}
 
     .chart-paper {{ background: #FBF9F3; border: 1px solid {RULE}; padding: 24px 28px; }}
     .chart-title {{ font-family: 'EB Garamond', serif; font-weight: 600; font-size: 32px; color: {INK}; }}
@@ -705,6 +764,55 @@ with st.expander("Input mode & publish settings", expanded=False):
                 st.selectbox("Publish in key", MAJOR_KEYS, key="publish_key")
             if st.session_state["written_key"] != st.session_state["publish_key"]:
                 st.caption(f"Transposing from {st.session_state['written_key']} to {st.session_state['publish_key']}.")
+
+# --------------------------------------------------------------------------
+# Save / load named chart files (separate from the automatic session autosave)
+# --------------------------------------------------------------------------
+with st.expander("Save / load chart files", expanded=False):
+    st.caption(
+        "These are files you name and place yourself — independent of the automatic "
+        "session save above. Files without an extension are saved as \".chord\". "
+        "The folder lives on whichever machine is running this app."
+    )
+    fc1, fc2 = st.columns([2, 1])
+    with fc1:
+        st.text_input("Folder", key="file_folder")
+    with fc2:
+        st.text_input("File name", key="file_name")
+
+    st.button(
+        "💾 Save to file", key="save_named_file",
+        on_click=save_chart_to_file, args=(st.session_state["file_folder"], st.session_state["file_name"]),
+    )
+    save_status = st.session_state.get("file_save_status")
+    if save_status:
+        kind, msg = save_status
+        (st.success if kind == "ok" else st.error)(f"{'Saved to' if kind == 'ok' else 'Could not save'}: {msg}")
+
+    st.divider()
+
+    files = list_chart_files(st.session_state["file_folder"])
+    if files:
+        if st.session_state.get("file_pick") not in files:
+            st.session_state["file_pick"] = files[0]
+        st.selectbox("Chart files in this folder", files, key="file_pick")
+        st.button(
+            "📂 Load selected file", key="load_named_file",
+            on_click=load_chart_from_path,
+            args=(str(Path(st.session_state["file_folder"]).expanduser() / st.session_state["file_pick"]),),
+        )
+    else:
+        st.caption("No .chord files found in that folder yet.")
+
+    st.text_input("…or type a full file path to load", key="file_path_manual", placeholder="/path/to/chart.chord")
+    st.button(
+        "📂 Load from path", key="load_named_path",
+        on_click=load_chart_from_path, args=(st.session_state.get("file_path_manual", ""),),
+    )
+    load_status = st.session_state.get("file_load_status")
+    if load_status:
+        kind, msg = load_status
+        (st.success if kind == "ok" else st.error)(f"{'Loaded' if kind == 'ok' else 'Could not load'}: {msg}")
 
 # --------------------------------------------------------------------------
 # Editor + preview
@@ -1052,3 +1160,7 @@ with pdf_placeholder:
         mime="application/pdf",
         use_container_width=True,
     )
+
+# Autosave on every rerun (i.e. after every edit) — a plain file write,
+# so there's no browser permission to fail.
+save_to_disk()
