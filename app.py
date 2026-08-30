@@ -126,11 +126,15 @@ def sanitize_filename(name: str) -> str:
     return name or "chart"
 
 
-def resolved_chart_path(folder: str, filename: str) -> Path:
+def ensure_chord_filename(filename: str) -> str:
     fname = filename.strip() or "chart"
     if "." not in fname:
         fname += ".chord"
-    return Path(folder).expanduser() / fname
+    return fname
+
+
+def resolved_chart_path(folder: str, filename: str) -> Path:
+    return Path(folder).expanduser() / ensure_chord_filename(filename)
 
 
 def list_chart_files(folder: str):
@@ -784,6 +788,15 @@ with st.expander("Save / load chart files", expanded=False):
         "💾 Save to file", key="save_named_file",
         on_click=save_chart_to_file, args=(st.session_state["file_folder"], st.session_state["file_name"]),
     )
+    dl1, dl2 = st.columns(2)
+    with dl1:
+        st.download_button(
+            "⬇ Download current chart",
+            data=json.dumps(collect_data(), ensure_ascii=False, indent=2),
+            file_name=ensure_chord_filename(st.session_state["file_name"]),
+            mime="application/json",
+            use_container_width=True,
+        )
     save_status = st.session_state.get("file_save_status")
     if save_status:
         kind, msg = save_status
@@ -796,11 +809,23 @@ with st.expander("Save / load chart files", expanded=False):
         if st.session_state.get("file_pick") not in files:
             st.session_state["file_pick"] = files[0]
         st.selectbox("Chart files in this folder", files, key="file_pick")
-        st.button(
-            "📂 Load selected file", key="load_named_file",
-            on_click=load_chart_from_path,
-            args=(str(Path(st.session_state["file_folder"]).expanduser() / st.session_state["file_pick"]),),
-        )
+        lc1, lc2 = st.columns(2)
+        with lc1:
+            st.button(
+                "📂 Load selected file", key="load_named_file",
+                on_click=load_chart_from_path,
+                args=(str(Path(st.session_state["file_folder"]).expanduser() / st.session_state["file_pick"]),),
+                use_container_width=True,
+            )
+        with lc2:
+            try:
+                selected_bytes = (Path(st.session_state["file_folder"]).expanduser() / st.session_state["file_pick"]).read_bytes()
+            except Exception:
+                selected_bytes = b""
+            st.download_button(
+                "⬇ Download this file", data=selected_bytes, file_name=st.session_state["file_pick"],
+                mime="application/json", use_container_width=True,
+            )
     else:
         st.caption("No .chord files found in that folder yet.")
 
