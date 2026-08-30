@@ -52,6 +52,10 @@ Beyond the automatic session save, open **Save / load chart files** to:
 - **Load** any `.chord` file back — pick one from a dropdown of files found
   in the folder you specified, or paste a full file path to load from
   anywhere else on disk.
+- **Download** the current chart, or any listed file, straight to your own
+  device's browser downloads — this works over the network even when the
+  app is deployed remotely, since it's a normal browser download rather
+  than a server-disk operation.
 
 The folder is wherever this app is actually running: your own computer if
 you run it locally, or the host's storage if you've deployed it (see
