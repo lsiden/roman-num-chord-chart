@@ -42,6 +42,21 @@ exported PDF:
   key, which occasionally differs by enharmonic spelling from a strict
   interval-preserving transposition.
 
+## Saving named chart files
+
+Beyond the automatic session save, open **Save / load chart files** to:
+
+- **Save** the current chart under a name and folder you choose. Leave off
+  an extension and it's saved as `.chord` (e.g. "My Song" → `My Song.chord`);
+  typing your own extension is respected as-is.
+- **Load** any `.chord` file back — pick one from a dropdown of files found
+  in the folder you specified, or paste a full file path to load from
+  anywhere else on disk.
+
+The folder is wherever this app is actually running: your own computer if
+you run it locally, or the host's storage if you've deployed it (see
+"Getting this onto your iPad" below for what that means for persistence).
+
 ## Why Python instead of the in-browser version
 
 The chat artifact ran inside a sandboxed webpage that doesn't grant full
