@@ -1052,7 +1052,3 @@ with pdf_placeholder:
         mime="application/pdf",
         use_container_width=True,
     )
-
-# Autosave on every rerun (i.e. after every edit) — a plain file write,
-# so there's no browser permission to fail.
-save_to_disk()
