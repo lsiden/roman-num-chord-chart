@@ -566,6 +566,7 @@ if "initialized" not in st.session_state:
     st.session_state["publish_display"] = "Roman numerals"
     st.session_state["written_key"] = "C"
     st.session_state["publish_key"] = "C"
+    st.session_state["show_key_change_controls"] = True
     st.session_state["save_status"] = "idle"
     st.session_state["clipboard"] = None
     st.session_state["next_id"] = 2
@@ -675,6 +676,7 @@ with st.expander("Input mode & publish settings", expanded=False):
                 "e.g. V7, ii6, vii°7, V7/V — type the numeral then anything else; "
                 "it's superscripted automatically. \"^\" always means major 7th (Δ)."
             )
+            st.toggle("Show key-change dropdowns on each measure", key="show_key_change_controls")
         else:
             st.caption(
                 "e.g. E7, Ab^ (= Ab major 7), Dm7, C/E — type the root then anything else; "
@@ -769,11 +771,12 @@ with editor_col:
                         )
                         if st.session_state["input_mode"] == "roman":
                             st.session_state.setdefault(f"mkey_{sid}_{i}", NO_KEY_CHANGE)
-                            st.selectbox(
-                                f"key change m.{i}", options=KEY_CHANGE_OPTIONS,
-                                format_func=key_change_label, key=f"mkey_{sid}_{i}",
-                                label_visibility="collapsed",
-                            )
+                            if st.session_state.get("show_key_change_controls", True):
+                                st.selectbox(
+                                    f"key change m.{i}", options=KEY_CHANGE_OPTIONS,
+                                    format_func=key_change_label, key=f"mkey_{sid}_{i}",
+                                    label_visibility="collapsed",
+                                )
 
             with st.expander("Copy / paste"):
                 st.session_state[f"copyfrom_{sid}"] = min(st.session_state.get(f"copyfrom_{sid}", 1), n)
