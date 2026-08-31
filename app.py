@@ -18,6 +18,36 @@ from reportlab.lib.pagesizes import letter as LETTER_SIZE
 from reportlab.lib.units import inch
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+# --------------------------------------------------------------------------
+# Realbook-style font for the PDF, if you supply one
+#
+# ReportLab only ships the 14 standard PDF fonts (Times, Helvetica, etc.) —
+# there's no built-in "Real Book" hand-lettered jazz font, and licensed
+# fonts (e.g. New Real Book Chords, LilyJAZZText, LeadSheet) can't be
+# bundled here. Drop a .ttf/.otf file you're licensed to use into a
+# "fonts" folder next to this script (see README) and it's picked up
+# automatically; otherwise the PDF falls back to Times Bold Italic.
+# --------------------------------------------------------------------------
+FONTS_DIR = Path(__file__).parent / "fonts"
+REALBOOK_FONT_NAME = "Realbook"
+REALBOOK_AVAILABLE = False
+REALBOOK_FONT_FILE = None
+for _candidate in (sorted(FONTS_DIR.glob("*.ttf")) + sorted(FONTS_DIR.glob("*.otf")) if FONTS_DIR.exists() else []):
+    try:
+        pdfmetrics.registerFont(TTFont(REALBOOK_FONT_NAME, str(_candidate)))
+        REALBOOK_AVAILABLE = True
+        REALBOOK_FONT_FILE = _candidate.name
+        break
+    except Exception:
+        continue
+
+PDF_FONT_TITLE = REALBOOK_FONT_NAME if REALBOOK_AVAILABLE else "Times-Bold"
+PDF_FONT_BODY = REALBOOK_FONT_NAME if REALBOOK_AVAILABLE else "Times-Italic"
+PDF_FONT_CHORD = REALBOOK_FONT_NAME if REALBOOK_AVAILABLE else "Times-BoldItalic"
+PDF_FONT_LABEL = REALBOOK_FONT_NAME if REALBOOK_AVAILABLE else "Helvetica-Bold"
 
 # --------------------------------------------------------------------------
 # Persistence
@@ -58,6 +88,8 @@ def collect_data() -> dict:
         "publish_display": st.session_state.get("publish_display", "Roman numerals"),
         "written_key": st.session_state.get("written_key", "C"),
         "publish_key": st.session_state.get("publish_key", "C"),
+        "bg_color": st.session_state.get("bg_color", "#EEEAE0"),
+        "fg_color": st.session_state.get("fg_color", "#2A241E"),
         "sections": sections,
     }
 
@@ -83,6 +115,8 @@ def apply_chart_data(data: dict):
     st.session_state["publish_display"] = data.get("publish_display", "Roman numerals")
     st.session_state["written_key"] = data.get("written_key", "C")
     st.session_state["publish_key"] = data.get("publish_key", "C")
+    st.session_state["bg_color"] = data.get("bg_color", "#EEEAE0")
+    st.session_state["fg_color"] = data.get("fg_color", "#2A241E")
 
     order = []
     max_id = 0
@@ -189,6 +223,23 @@ KEY_BY_SEMITONE = ["C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "
 
 ROMAN_TO_DEGREE = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7}
 _ROMAN_PATTERN = re.compile(r"^([#b]*)(VII|vii|III|iii|VI|vi|IV|iv|II|ii|V|v|I|i)")
+
+
+def hex_to_rgb(hex_color: str):
+    h = hex_color.lstrip("#")
+    if len(h) == 3:
+        h = "".join(ch * 2 for ch in h)
+    return tuple(int(h[i : i + 2], 16) for i in (0, 2, 4))
+
+
+def hex_to_rgb01(hex_color: str):
+    r, g, b = hex_to_rgb(hex_color)
+    return r / 255, g / 255, b / 255
+
+
+def hex_to_rgba_css(hex_color: str, alpha: float) -> str:
+    r, g, b = hex_to_rgb(hex_color)
+    return f"rgba({r},{g},{b},{alpha})"
 
 
 def apply_chord_shorthand(text: str) -> str:
@@ -627,8 +678,9 @@ if "initialized" not in st.session_state:
     st.session_state["publish_display"] = "Roman numerals"
     st.session_state["written_key"] = "C"
     st.session_state["publish_key"] = "C"
-    st.session_state["show_key_change_controls"] = True
     st.session_state["file_folder"] = str(DEFAULT_CHART_FOLDER)
+    st.session_state["bg_color"] = "#EEEAE0"
+    st.session_state["fg_color"] = "#2A241E"
     st.session_state["file_name"] = sanitize_filename(st.session_state["title"])
     st.session_state["save_status"] = "idle"
     st.session_state["clipboard"] = None
@@ -647,7 +699,13 @@ if "initialized" not in st.session_state:
 # --------------------------------------------------------------------------
 st.set_page_config(page_title="Chord Chart", layout="wide")
 
-INK, ACCENT, PAPER, PAPER_CARD, RULE = "#2A241E", "#7A2E2E", "#EEEAE0", "#F6F3EA", "#C9C0AC"
+INK = st.session_state.get("fg_color", "#2A241E")
+PAPER = st.session_state.get("bg_color", "#EEEAE0")
+ACCENT = "#7A2E2E"
+PAPER_CARD = PAPER
+RULE = hex_to_rgba_css(INK, 0.35)
+MUTED = hex_to_rgba_css(INK, 0.65)
+MUTED2 = hex_to_rgba_css(INK, 0.5)
 
 st.markdown(
     f"""
@@ -656,18 +714,18 @@ st.markdown(
     .stApp {{ background: {PAPER}; }}
     .block-container {{ padding-top: calc(2rem + 0.5in); max-width: 1200px; }}
 
-    .chart-paper {{ background: #FBF9F3; border: 1px solid {RULE}; padding: 24px 28px; }}
+    .chart-paper {{ background: {PAPER}; border: 1px solid {RULE}; padding: 24px 28px; }}
     .chart-title {{ font-family: 'EB Garamond', serif; font-weight: 600; font-size: 32px; color: {INK}; }}
-    .chart-subtitle {{ font-family: 'EB Garamond', serif; font-style: italic; font-size: 15px; color: #6b6459; margin-bottom: 14px; }}
+    .chart-subtitle {{ font-family: 'EB Garamond', serif; font-style: italic; font-size: 15px; color: {MUTED}; margin-bottom: 14px; }}
 
     .notes-box {{ margin-bottom: 26px; }}
-    .notes-label {{ display:block; margin-bottom:4px; font-family:'JetBrains Mono',monospace; font-size:10px; letter-spacing:0.08em; color:#9b9284; }}
+    .notes-label {{ display:block; margin-bottom:4px; font-family:'JetBrains Mono',monospace; font-size:10px; letter-spacing:0.08em; color:{MUTED2}; }}
     .notes-text {{ font-family:'EB Garamond', serif; font-style:italic; font-size:15px; color:{INK}; border:1px solid {RULE}; background:{PAPER_CARD}; padding:8px 12px; white-space:pre-wrap; min-height: 1.4em; }}
 
     .section-block {{ margin-bottom: 34px; }}
     .section-header {{ display:flex; align-items:baseline; gap:12px; margin-bottom:8px; }}
     .section-letter {{ font-family:'EB Garamond', serif; font-weight:600; font-size:24px; color:{INK}; }}
-    .section-name {{ font-family:'JetBrains Mono',monospace; font-size:12px; color:#6b6459; letter-spacing:0.03em; }}
+    .section-name {{ font-family:'JetBrains Mono',monospace; font-size:12px; color:{MUTED}; letter-spacing:0.03em; }}
     .section-repeat-note {{ font-family:'JetBrains Mono',monospace; font-size:11px; color:{ACCENT}; }}
     .section-hr {{ flex:1; border-bottom:1px solid {RULE}; }}
 
@@ -722,6 +780,25 @@ with col_actions:
         pdf_placeholder = st.container()
 
 # --------------------------------------------------------------------------
+# Appearance — background/foreground colors, for contrast
+# --------------------------------------------------------------------------
+with st.expander("Appearance (colors & font)", expanded=False):
+    ap1, ap2 = st.columns(2)
+    with ap1:
+        st.color_picker("Background color", key="bg_color")
+    with ap2:
+        st.color_picker("Text / line color", key="fg_color")
+    st.caption("Applies to the chart on screen and in the exported PDF.")
+    if REALBOOK_AVAILABLE:
+        st.caption(f"PDF font: using {REALBOOK_FONT_FILE} from the fonts folder.")
+    else:
+        st.caption(
+            "PDF font: no Realbook-style font found, so PDFs use Times Bold Italic. "
+            "Drop a .ttf/.otf you're licensed to use (e.g. MuseJazz) into a \"fonts\" "
+            "folder next to app.py to switch the PDF to that font."
+        )
+
+# --------------------------------------------------------------------------
 # Input mode + publish/transpose settings
 # --------------------------------------------------------------------------
 with st.expander("Input mode & publish settings", expanded=False):
@@ -739,7 +816,6 @@ with st.expander("Input mode & publish settings", expanded=False):
                 "e.g. V7, ii6, vii°7, V7/V — type the numeral then anything else; "
                 "it's superscripted automatically. \"^\" always means major 7th (Δ)."
             )
-            st.toggle("Show key-change dropdowns on each measure", key="show_key_change_controls")
         else:
             st.caption(
                 "e.g. E7, Ab^ (= Ab major 7), Dm7, C/E — type the root then anything else; "
@@ -890,6 +966,14 @@ with editor_col:
 
             n = st.session_state[f"mcount_{sid}"]
             for row_start in range(0, n, 4):
+                row_end = min(row_start + 4, n)
+                show_row_keys = True
+                if st.session_state["input_mode"] == "roman":
+                    row_toggle_key = f"showkey_{sid}_{row_start}"
+                    st.session_state.setdefault(row_toggle_key, True)
+                    st.toggle(f"Key changes for m.{row_start + 1}–{row_end}", key=row_toggle_key)
+                    show_row_keys = st.session_state[row_toggle_key]
+
                 cols = st.columns(4)
                 for c in range(4):
                     i = row_start + c
@@ -904,7 +988,7 @@ with editor_col:
                         )
                         if st.session_state["input_mode"] == "roman":
                             st.session_state.setdefault(f"mkey_{sid}_{i}", NO_KEY_CHANGE)
-                            if st.session_state.get("show_key_change_controls", True):
+                            if show_row_keys:
                                 st.selectbox(
                                     f"key change m.{i}", options=KEY_CHANGE_OPTIONS,
                                     format_func=key_change_label, key=f"mkey_{sid}_{i}",
@@ -1059,7 +1143,7 @@ def render_chord_pdf(c: canvas.Canvas, text: str, bx: float, by: float, bw: floa
     if not text or not text.strip():
         return
     pieces = [parse_chord_token(tok, mode) for tok in text.strip().split()]
-    base_font, sup_font, base_size, sup_size = "Times-BoldItalic", "Times-BoldItalic", 15, 9
+    base_font, sup_font, base_size, sup_size = PDF_FONT_CHORD, PDF_FONT_CHORD, 15, 9
     seg_widths = []
     for base, sup, slash in pieces:
         w = stringWidth(base, base_font, base_size)
@@ -1093,15 +1177,26 @@ def build_pdf(data: dict, parse_mode: str) -> bytes:
     margin = 0.6 * inch
     x, y = margin, height - margin
 
-    c.setFont("Times-Bold", 20)
+    bg_rgb = hex_to_rgb01(data.get("bg_color", "#EEEAE0"))
+    fg_rgb = hex_to_rgb01(data.get("fg_color", "#2A241E"))
+
+    def _paint_page_background():
+        c.setFillColorRGB(*bg_rgb)
+        c.rect(0, 0, width, height, fill=1, stroke=0)
+        c.setFillColorRGB(*fg_rgb)
+        c.setStrokeColorRGB(*fg_rgb)
+
+    _paint_page_background()
+
+    c.setFont(PDF_FONT_TITLE, 20)
     c.drawString(x, y, data["title"] or "Untitled Chart")
     y -= 20
     if data["subtitle"]:
-        c.setFont("Times-Italic", 11)
+        c.setFont(PDF_FONT_BODY, 11)
         c.drawString(x, y, data["subtitle"])
         y -= 18
     if data["notes"].strip():
-        c.setFont("Times-Italic", 10)
+        c.setFont(PDF_FONT_BODY, 10)
         for line in textwrap.wrap(data["notes"], 95) or [""]:
             c.drawString(x, y, line)
             y -= 13
@@ -1114,8 +1209,9 @@ def build_pdf(data: dict, parse_mode: str) -> bytes:
     for sec in data["sections"]:
         if y < margin + box_h * 2:
             c.showPage()
+            _paint_page_background()
             y = height - margin
-        c.setFont("Times-Bold", 13)
+        c.setFont(PDF_FONT_TITLE, 13)
         label = sec["label"]
         if sec["name"]:
             label += "   " + sec["name"].upper()
@@ -1132,6 +1228,7 @@ def build_pdf(data: dict, parse_mode: str) -> bytes:
         for row_start in range(0, n, 4):
             if y < margin:
                 c.showPage()
+                _paint_page_background()
                 y = height - margin
             row = measures[row_start : row_start + 4]
             for i, text in enumerate(row):
@@ -1144,10 +1241,10 @@ def build_pdf(data: dict, parse_mode: str) -> bytes:
                     if kc is not None:
                         running_shift = kc
                         mod_key = shift_key(data.get("publish_key", "C"), running_shift)
-                        c.setFont("Helvetica-Bold", 7)
+                        c.setFont(PDF_FONT_LABEL, 7)
                         c.setFillColorRGB(0.48, 0.18, 0.18)
                         c.drawRightString(bx + box_w - 3, y + box_h - 9, f"\u2192 {mod_key} ({running_shift:+d})")
-                        c.setFillColorRGB(0, 0, 0)
+                        c.setFillColorRGB(*fg_rgb)
                     effective_key = data.get("publish_key", "C") if running_shift == 0 else shift_key(data.get("publish_key", "C"), running_shift)
                 else:
                     effective_key = None
@@ -1163,12 +1260,12 @@ def build_pdf(data: dict, parse_mode: str) -> bytes:
                     end_x = x + len(row) * box_w
                     c.setLineWidth(3)
                     c.line(end_x, y, end_x, y + box_h)
-                    c.setFont("Helvetica-Bold", 9)
+                    c.setFont(PDF_FONT_LABEL, 9)
                     c.setFillColorRGB(0.48, 0.18, 0.18)
                     c.drawRightString(end_x, y + box_h + 4, f"x{sec['repeats']}")
-                    c.setFillColorRGB(0, 0, 0)
+                    c.setFillColorRGB(*fg_rgb)
                 c.setLineWidth(1)
-                c.setStrokeColorRGB(0, 0, 0)
+                c.setStrokeColorRGB(*fg_rgb)
             y -= box_h
         y -= 18
 
