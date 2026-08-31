@@ -61,6 +61,28 @@ The folder is wherever this app is actually running: your own computer if
 you run it locally, or the host's storage if you've deployed it (see
 "Getting this onto your iPad" below for what that means for persistence).
 
+## Appearance and PDF font
+
+Open **Appearance (colors & font)** to:
+
+- Pick a **background color** and a **text/line color** for better
+  contrast — these apply to both the on-screen chart and the exported PDF,
+  and are saved with the chart.
+- See whether a Realbook-style PDF font was found. ReportLab only ships
+  the standard 14 PDF fonts (Times, Helvetica, etc.) — there's no built-in
+  hand-lettered jazz font, and licensed ones (New Real Book Chords,
+  LilyJAZZText, LeadSheet) can't be bundled here. Drop a `.ttf`/`.otf` file
+  you're licensed to use into a `fonts` folder next to `app.py` and it's
+  picked up automatically on the next run; MuseJazz (free from MuseScore)
+  is a common choice. Without one, PDFs use Times Bold Italic instead.
+
+## Per-row key-change visibility
+
+In Roman-numeral mode, each row of 4 measures has its own toggle
+("Key changes for m.5–8") to hide that row's key-change dropdowns — handy
+once you've set the modulations you need and just want a cleaner editor.
+Hiding a row's controls doesn't clear any key changes already set there.
+
 ## Why Python instead of the in-browser version
 
 The chat artifact ran inside a sandboxed webpage that doesn't grant full
