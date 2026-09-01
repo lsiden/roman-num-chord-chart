@@ -970,7 +970,7 @@ with editor_col:
                 show_row_keys = True
                 if st.session_state["input_mode"] == "roman":
                     row_toggle_key = f"showkey_{sid}_{row_start}"
-                    st.session_state.setdefault(row_toggle_key, True)
+                    st.session_state.setdefault(row_toggle_key, False)
                     st.toggle(f"Key changes for m.{row_start + 1}–{row_end}", key=row_toggle_key)
                     show_row_keys = st.session_state[row_toggle_key]
 
