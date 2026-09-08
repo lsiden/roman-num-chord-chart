@@ -244,6 +244,16 @@ def hex_to_rgba_css(hex_color: str, alpha: float) -> str:
 
 SHARP_TO_FLAT = {"C#": "Db", "D#": "Eb", "E#": "F", "F#": "Gb", "G#": "Ab", "A#": "Bb", "B#": "C"}
 
+_KEY_OF_PATTERN = re.compile(r"(key\s+of\s+)([A-G][#b]?)(?![A-Za-z])", re.IGNORECASE)
+
+
+def display_subtitle(subtitle: str, key: str) -> str:
+    """Keep a "Key of X" phrase in the subtitle in sync with the publish
+    key, without touching the stored subtitle the person actually typed."""
+    if not subtitle:
+        return subtitle
+    return _KEY_OF_PATTERN.sub(lambda m: m.group(1) + key, subtitle)
+
 
 def apply_chord_shorthand(text: str) -> str:
     if st.session_state.get("input_mode") == "name":
@@ -1102,7 +1112,7 @@ with preview_col:
     _running_shift = 0  # persists across sections until a measure sets a new one
 
     parts = [f'<div class="chart-paper"><div class="chart-title">{html.escape(data["title"])}</div>']
-    parts.append(f'<div class="chart-subtitle">{html.escape(data["subtitle"])}</div>')
+    parts.append(f'<div class="chart-subtitle">{html.escape(display_subtitle(data["subtitle"], data.get("publish_key", "C")))}</div>')
 
     if data["notes"].strip():
         parts.append(
@@ -1223,7 +1233,7 @@ def build_pdf(data: dict, parse_mode: str) -> bytes:
     y -= 20
     if data["subtitle"]:
         c.setFont(PDF_FONT_BODY, 11)
-        c.drawString(x, y, data["subtitle"])
+        c.drawString(x, y, display_subtitle(data["subtitle"], data.get("publish_key", "C")))
         y -= 18
     if data["notes"].strip():
         c.setFont(PDF_FONT_BODY, 10)
