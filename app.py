@@ -243,14 +243,16 @@ def hex_to_rgba_css(hex_color: str, alpha: float) -> str:
 
 
 def apply_chord_shorthand(text: str) -> str:
+    if st.session_state.get("input_mode") == "name":
+        # "m" right after the root means minor, unless it's "maj": "gm" -> "g-",
+        # "gm7" -> "g-7", but "gmaj7" is left alone.
+        text = re.sub(r"(^|[\s/])([A-Ga-g][#b]?)m(?!aj)", lambda m: m.group(1) + m.group(2) + "-", text)
     text = text.replace("-7b5", "ø")
     text = text.replace("^", "Δ")
     if st.session_state.get("input_mode") == "name":
-        # "-" right after the root means minor (jazz shorthand): "g-" -> "gm",
-        # "g-7" -> "gm7". Then capitalize the root/bass letter (start of a
-        # token, or right after "/"), leaving the accidental and everything
-        # else as typed: "bb7" -> "Bb7", "c7/e" -> "C7/E", "g-" -> "Gm".
-        text = re.sub(r"(^|[\s/])([A-Ga-g][#b]?)-", lambda m: m.group(1) + m.group(2) + "m", text)
+        # Capitalize the root/bass letter (start of a token, or right after
+        # "/"), leaving the accidental and everything else as typed:
+        # "bb7" -> "Bb7", "c7/e" -> "C7/E", "gm" -> "G-".
         text = re.sub(r"(^|[\s/])([a-g])", lambda m: m.group(1) + m.group(2).upper(), text)
     return text
 
@@ -403,8 +405,8 @@ def quality_to_suffix(quality: str, has7: bool, seventh_kind: str) -> str:
         return "maj7" if seventh_kind == "maj7" else "7"
     if quality == "minor":
         if not has7:
-            return "m"
-        return "m(maj7)" if seventh_kind == "maj7" else "m7"
+            return "-"
+        return "-(maj7)" if seventh_kind == "maj7" else "-7"
     if quality == "dim":
         return "°7" if has7 else "°"
     if quality == "halfdim":
