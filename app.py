@@ -242,6 +242,9 @@ def hex_to_rgba_css(hex_color: str, alpha: float) -> str:
     return f"rgba({r},{g},{b},{alpha})"
 
 
+SHARP_TO_FLAT = {"C#": "Db", "D#": "Eb", "E#": "F", "F#": "Gb", "G#": "Ab", "A#": "Bb", "B#": "C"}
+
+
 def apply_chord_shorthand(text: str) -> str:
     if st.session_state.get("input_mode") == "name":
         # "m" right after the root means minor, unless it's "maj": "gm" -> "g-",
@@ -254,6 +257,12 @@ def apply_chord_shorthand(text: str) -> str:
         # "/"), leaving the accidental and everything else as typed:
         # "bb7" -> "Bb7", "c7/e" -> "C7/E", "gm" -> "G-".
         text = re.sub(r"(^|[\s/])([a-g])", lambda m: m.group(1) + m.group(2).upper(), text)
+        # Always prefer the flat spelling: "A#7" -> "Bb7".
+        text = re.sub(
+            r"(^|[\s/])([A-G]#)",
+            lambda m: m.group(1) + SHARP_TO_FLAT.get(m.group(2), m.group(2)),
+            text,
+        )
     return text
 
 
