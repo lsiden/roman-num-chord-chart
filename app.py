@@ -245,6 +245,13 @@ def hex_to_rgba_css(hex_color: str, alpha: float) -> str:
 def apply_chord_shorthand(text: str) -> str:
     text = text.replace("-7b5", "ø")
     text = text.replace("^", "Δ")
+    if st.session_state.get("input_mode") == "name":
+        # "-" right after the root means minor (jazz shorthand): "g-" -> "gm",
+        # "g-7" -> "gm7". Then capitalize the root/bass letter (start of a
+        # token, or right after "/"), leaving the accidental and everything
+        # else as typed: "bb7" -> "Bb7", "c7/e" -> "C7/E", "g-" -> "Gm".
+        text = re.sub(r"(^|[\s/])([A-Ga-g][#b]?)-", lambda m: m.group(1) + m.group(2) + "m", text)
+        text = re.sub(r"(^|[\s/])([a-g])", lambda m: m.group(1) + m.group(2).upper(), text)
     return text
 
 
@@ -756,13 +763,25 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+def on_title_change():
+    if not st.session_state.get("file_name_touched", False):
+        st.session_state["file_name"] = sanitize_filename(st.session_state["title"])
+
+
+def on_filename_change():
+    st.session_state["file_name_touched"] = True
+
+
 # --------------------------------------------------------------------------
 # Header
 # --------------------------------------------------------------------------
 col_title, col_actions = st.columns([3, 2])
 
 with col_title:
-    st.text_input("Title", key="title", label_visibility="collapsed", placeholder="Chart title")
+    st.text_input(
+        "Title", key="title", label_visibility="collapsed", placeholder="Chart title",
+        on_change=on_title_change,
+    )
     st.text_input("Subtitle", key="subtitle", label_visibility="collapsed", placeholder="Key, tempo…")
 
 with col_actions:
