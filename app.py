@@ -82,7 +82,6 @@ def collect_data() -> dict:
         )
     return {
         "title": st.session_state.get("title", "Untitled Chart"),
-        "subtitle": st.session_state.get("subtitle", ""),
         "notes": st.session_state.get("notes", ""),
         "input_mode": st.session_state.get("input_mode", "roman"),
         "publish_display": st.session_state.get("publish_display", "Roman numerals"),
@@ -109,7 +108,6 @@ def save_to_disk():
 def apply_chart_data(data: dict):
     """Load a chart dict (however it was read) into session_state."""
     st.session_state["title"] = data.get("title", "Untitled Chart")
-    st.session_state["subtitle"] = data.get("subtitle", "")
     st.session_state["notes"] = data.get("notes", "")
     st.session_state["input_mode"] = data.get("input_mode", "roman")
     st.session_state["publish_display"] = data.get("publish_display", "Roman numerals")
@@ -167,10 +165,6 @@ def ensure_chord_filename(filename: str) -> str:
     return fname
 
 
-def resolved_chart_path(folder: str, filename: str) -> Path:
-    return Path(folder).expanduser() / ensure_chord_filename(filename)
-
-
 def list_chart_files(folder: str):
     try:
         folder_path = Path(folder).expanduser()
@@ -181,22 +175,21 @@ def list_chart_files(folder: str):
         return []
 
 
-def save_chart_to_file(folder: str, filename: str):
-    try:
-        path = resolved_chart_path(folder, filename)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(collect_data(), ensure_ascii=False, indent=2), encoding="utf-8")
-        st.session_state["file_save_status"] = ("ok", str(path))
-    except Exception as e:
-        st.session_state["file_save_status"] = ("error", str(e))
-
-
 def load_chart_from_path(path_str: str):
     try:
         path = Path(path_str).expanduser()
         data = json.loads(path.read_text(encoding="utf-8"))
         apply_chart_data(data)
         st.session_state["file_load_status"] = ("ok", str(path))
+    except Exception as e:
+        st.session_state["file_load_status"] = ("error", str(e))
+
+
+def load_chart_from_upload(uploaded_file):
+    try:
+        data = json.loads(uploaded_file.getvalue().decode("utf-8"))
+        apply_chart_data(data)
+        st.session_state["file_load_status"] = ("ok", uploaded_file.name)
     except Exception as e:
         st.session_state["file_load_status"] = ("error", str(e))
 
@@ -243,16 +236,6 @@ def hex_to_rgba_css(hex_color: str, alpha: float) -> str:
 
 
 SHARP_TO_FLAT = {"C#": "Db", "D#": "Eb", "E#": "F", "F#": "Gb", "G#": "Ab", "A#": "Bb", "B#": "C"}
-
-_KEY_OF_PATTERN = re.compile(r"(key\s+of\s+)([A-G][#b]?)(?![A-Za-z])", re.IGNORECASE)
-
-
-def display_subtitle(subtitle: str, key: str) -> str:
-    """Keep a "Key of X" phrase in the subtitle in sync with the publish
-    key, without touching the stored subtitle the person actually typed."""
-    if not subtitle:
-        return subtitle
-    return _KEY_OF_PATTERN.sub(lambda m: m.group(1) + key, subtitle)
 
 
 def apply_chord_shorthand(text: str) -> str:
@@ -700,7 +683,6 @@ def clear_clipboard():
 if "initialized" not in st.session_state:
     st.session_state["initialized"] = True
     st.session_state["title"] = "Untitled Chart"
-    st.session_state["subtitle"] = "Key of C · ♩ = 96"
     st.session_state["notes"] = ""
     st.session_state["input_mode"] = "roman"
     st.session_state["publish_display"] = "Roman numerals"
@@ -744,7 +726,6 @@ st.markdown(
 
     .chart-paper {{ background: {PAPER}; border: 1px solid {RULE}; padding: 24px 28px; }}
     .chart-title {{ font-family: 'EB Garamond', serif; font-weight: 600; font-size: 32px; color: {INK}; }}
-    .chart-subtitle {{ font-family: 'EB Garamond', serif; font-style: italic; font-size: 15px; color: {MUTED}; margin-bottom: 14px; }}
 
     .notes-box {{ margin-bottom: 26px; }}
     .notes-label {{ display:block; margin-bottom:4px; font-family:'JetBrains Mono',monospace; font-size:10px; letter-spacing:0.08em; color:{MUTED2}; }}
@@ -803,10 +784,9 @@ with col_title:
         "Title", key="title", label_visibility="collapsed", placeholder="Chart title",
         on_change=on_title_change,
     )
-    st.text_input("Subtitle", key="subtitle", label_visibility="collapsed", placeholder="Key, tempo…")
 
 with col_actions:
-    a, b, c1 = st.columns([1.3, 1, 1])
+    a, c1 = st.columns([2, 1])
     with a:
         if st.session_state.get("save_status") == "error":
             st.error(f"Couldn't save: {st.session_state.get('save_error', '')}", icon="⚠️")
@@ -814,8 +794,6 @@ with col_actions:
             st.caption(f"💾 Saved to disk at {st.session_state.get('save_time', '')}")
         else:
             st.caption("💾 Saving…")
-    with b:
-        st.button("Save now", on_click=save_to_disk, use_container_width=True)
     with c1:
         pdf_placeholder = st.container()
 
@@ -890,9 +868,9 @@ with st.expander("Input mode & publish settings", expanded=False):
 # --------------------------------------------------------------------------
 with st.expander("Save / load chart files", expanded=False):
     st.caption(
-        "These are files you name and place yourself — independent of the automatic "
-        "session save above. Files without an extension are saved as \".chord\". "
-        "The folder lives on whichever machine is running this app."
+        "Download saves a \".chord\" file to your device. The folder below is "
+        "only used to browse and load files already sitting on whichever "
+        "machine is running this app."
     )
     fc1, fc2 = st.columns([2, 1])
     with fc1:
@@ -900,23 +878,12 @@ with st.expander("Save / load chart files", expanded=False):
     with fc2:
         st.text_input("File name", key="file_name")
 
-    st.button(
-        "💾 Save to file", key="save_named_file",
-        on_click=save_chart_to_file, args=(st.session_state["file_folder"], st.session_state["file_name"]),
+    st.download_button(
+        "⬇ Download JSON",
+        data=json.dumps(collect_data(), ensure_ascii=False, indent=2),
+        file_name=ensure_chord_filename(st.session_state["file_name"]),
+        mime="application/json",
     )
-    dl1, dl2 = st.columns(2)
-    with dl1:
-        st.download_button(
-            "⬇ Download current chart",
-            data=json.dumps(collect_data(), ensure_ascii=False, indent=2),
-            file_name=ensure_chord_filename(st.session_state["file_name"]),
-            mime="application/json",
-            use_container_width=True,
-        )
-    save_status = st.session_state.get("file_save_status")
-    if save_status:
-        kind, msg = save_status
-        (st.success if kind == "ok" else st.error)(f"{'Saved to' if kind == 'ok' else 'Could not save'}: {msg}")
 
     st.divider()
 
@@ -945,11 +912,12 @@ with st.expander("Save / load chart files", expanded=False):
     else:
         st.caption("No .chord files found in that folder yet.")
 
-    st.text_input("…or type a full file path to load", key="file_path_manual", placeholder="/path/to/chart.chord")
-    st.button(
-        "📂 Load from path", key="load_named_path",
-        on_click=load_chart_from_path, args=(st.session_state.get("file_path_manual", ""),),
-    )
+    uploaded = st.file_uploader("…or pick a file to load", type=["chord"], key="chart_upload")
+    if uploaded is not None:
+        st.button(
+            "📂 Load uploaded file", key="load_uploaded_file",
+            on_click=load_chart_from_upload, args=(uploaded,),
+        )
     load_status = st.session_state.get("file_load_status")
     if load_status:
         kind, msg = load_status
@@ -1112,7 +1080,6 @@ with preview_col:
     _running_shift = 0  # persists across sections until a measure sets a new one
 
     parts = [f'<div class="chart-paper"><div class="chart-title">{html.escape(data["title"])}</div>']
-    parts.append(f'<div class="chart-subtitle">{html.escape(display_subtitle(data["subtitle"], data.get("publish_key", "C")))}</div>')
 
     if data["notes"].strip():
         parts.append(
@@ -1231,10 +1198,6 @@ def build_pdf(data: dict, parse_mode: str) -> bytes:
     c.setFont(PDF_FONT_TITLE, 20)
     c.drawString(x, y, data["title"] or "Untitled Chart")
     y -= 20
-    if data["subtitle"]:
-        c.setFont(PDF_FONT_BODY, 11)
-        c.drawString(x, y, display_subtitle(data["subtitle"], data.get("publish_key", "C")))
-        y -= 18
     if data["notes"].strip():
         c.setFont(PDF_FONT_BODY, 10)
         for line in textwrap.wrap(data["notes"], 95) or [""]:
