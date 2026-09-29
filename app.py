@@ -68,18 +68,11 @@ DEFAULT_CHART_FOLDER = Path(__file__).parent / "charts"
 def collect_data() -> dict:
     sections = []
     for i, sid in enumerate(st.session_state["section_order"]):
-        n = st.session_state[f"mcount_{sid}"]
-        sections.append(
-            {
-                "id": sid,
-                "label": chr(65 + i),
-                "name": st.session_state.get(f"name_{sid}", ""),
-                "measure_count": n,
-                "repeats": st.session_state.get(f"repeats_{sid}", 1),
-                "measures": [st.session_state.get(f"m_{sid}_{i}", "") for i in range(n)],
-                "key_changes": [get_key_change(sid, i) for i in range(n)],
-            }
-        )
+        snap = _section_snapshot(sid)
+        snap["id"] = sid
+        snap["label"] = chr(65 + i)
+        snap["measure_count"] = len(snap["measures"])
+        sections.append(snap)
     return {
         "title": st.session_state.get("title", "Untitled Chart"),
         "notes": st.session_state.get("notes", ""),
@@ -539,6 +532,34 @@ def resolve_display_text(raw_text: str, roman_key: str = None) -> str:
     return " ".join(out)
 
 
+def compute_modulations(data: dict):
+    """Returns a list (parallel to data["sections"]) of per-measure
+    (effective_key, pivot_shift) pairs. pivot_shift is the value a measure
+    explicitly set there (None elsewhere and whenever not in roman mode);
+    effective_key is the key in force at that measure (None outside roman
+    mode). The shift persists across sections until a later measure resets
+    it, so this is computed once and shared by the preview and the PDF."""
+    is_roman = data["input_mode"] == "roman"
+    publish_key = data.get("publish_key", "C")
+    running_shift = 0
+    result = []
+    for sec in data["sections"]:
+        measures = sec["measures"]
+        key_changes = sec.get("key_changes", [None] * len(measures))
+        per_measure = []
+        for gi in range(len(measures)):
+            pivot_shift = key_changes[gi] if gi < len(key_changes) else None
+            if is_roman and pivot_shift is not None:
+                running_shift = pivot_shift
+            if is_roman:
+                effective_key = publish_key if running_shift == 0 else shift_key(publish_key, running_shift)
+            else:
+                effective_key = None
+            per_measure.append((effective_key, pivot_shift if is_roman else None))
+        result.append(per_measure)
+    return result
+
+
 # --------------------------------------------------------------------------
 # Section helpers
 # --------------------------------------------------------------------------
@@ -585,6 +606,31 @@ def on_measure_text_change(sid: int, idx: int):
 # direct access to the system clipboard. Holds either a range of measures
 # or an entire section at a time.
 # --------------------------------------------------------------------------
+def _section_snapshot(sid: int) -> dict:
+    """Everything about a section except its id/order — used by copy and by
+    the autosave/file format alike."""
+    n = st.session_state[f"mcount_{sid}"]
+    return {
+        "name": st.session_state.get(f"name_{sid}", ""),
+        "repeats": st.session_state.get(f"repeats_{sid}", 1),
+        "measures": [st.session_state.get(f"m_{sid}_{i}", "") for i in range(n)],
+        "key_changes": [get_key_change(sid, i) for i in range(n)],
+    }
+
+
+def _apply_section_snapshot(sid: int, data: dict):
+    """Write a _section_snapshot()-shaped dict into a (possibly new) section."""
+    st.session_state[f"name_{sid}"] = data.get("name", "")
+    st.session_state[f"repeats_{sid}"] = data.get("repeats", 1)
+    measures = data.get("measures", [])
+    key_changes = data.get("key_changes", [None] * len(measures))
+    st.session_state[f"mcount_{sid}"] = len(measures)
+    for i, v in enumerate(measures):
+        st.session_state[f"m_{sid}_{i}"] = v
+    for i, v in enumerate(key_changes):
+        set_key_change(sid, i, v)
+
+
 def copy_measures(sid: int, letter: str, start_1idx: int, end_1idx: int):
     n = st.session_state[f"mcount_{sid}"]
     start = max(1, min(start_1idx, n)) - 1
@@ -605,12 +651,7 @@ def copy_section(sid: int, letter: str):
     n = st.session_state[f"mcount_{sid}"]
     st.session_state["clipboard"] = {
         "type": "section",
-        "data": {
-            "name": st.session_state.get(f"name_{sid}", ""),
-            "repeats": st.session_state.get(f"repeats_{sid}", 1),
-            "measures": [st.session_state.get(f"m_{sid}_{i}", "") for i in range(n)],
-            "key_changes": [get_key_change(sid, i) for i in range(n)],
-        },
+        "data": _section_snapshot(sid),
         "desc": f"section {letter} ({n} measures)",
     }
 
@@ -638,18 +679,9 @@ def paste_section_after(after_sid):
     clip = st.session_state.get("clipboard")
     if not clip or clip["type"] != "section":
         return
-    data = clip["data"]
     new_sid = st.session_state["next_id"]
     st.session_state["next_id"] += 1
-    st.session_state[f"name_{new_sid}"] = data["name"]
-    st.session_state[f"repeats_{new_sid}"] = data["repeats"]
-    measures = data["measures"]
-    key_changes = data.get("key_changes", [None] * len(measures))
-    st.session_state[f"mcount_{new_sid}"] = len(measures)
-    for i, v in enumerate(measures):
-        st.session_state[f"m_{new_sid}_{i}"] = v
-    for i, v in enumerate(key_changes):
-        set_key_change(new_sid, i, v)
+    _apply_section_snapshot(new_sid, clip["data"])
     order = st.session_state["section_order"]
     if after_sid is None:
         order.append(new_sid)
@@ -661,16 +693,7 @@ def replace_section(sid: int):
     clip = st.session_state.get("clipboard")
     if not clip or clip["type"] != "section":
         return
-    data = clip["data"]
-    st.session_state[f"name_{sid}"] = data["name"]
-    st.session_state[f"repeats_{sid}"] = data["repeats"]
-    measures = data["measures"]
-    key_changes = data.get("key_changes", [None] * len(measures))
-    st.session_state[f"mcount_{sid}"] = len(measures)
-    for i, v in enumerate(measures):
-        st.session_state[f"m_{sid}_{i}"] = v
-    for i, v in enumerate(key_changes):
-        set_key_change(sid, i, v)
+    _apply_section_snapshot(sid, clip["data"])
 
 
 def clear_clipboard():
@@ -876,7 +899,7 @@ with st.expander("Save / load chart files", expanded=False):
     with fc1:
         st.text_input("Folder", key="file_folder")
     with fc2:
-        st.text_input("File name", key="file_name")
+        st.text_input("File name", key="file_name", on_change=on_filename_change)
 
     st.download_button(
         "⬇ Download JSON",
@@ -1077,7 +1100,7 @@ with editor_col:
 with preview_col:
     data = collect_data()
     _parse_mode = current_display_parse_mode()
-    _running_shift = 0  # persists across sections until a measure sets a new one
+    _modulations = compute_modulations(data)
 
     parts = [f'<div class="chart-paper"><div class="chart-title">{html.escape(data["title"])}</div>']
 
@@ -1087,7 +1110,7 @@ with preview_col:
             f'<div class="notes-text">{html.escape(data["notes"])}</div></div>'
         )
 
-    for sec in data["sections"]:
+    for sec_idx, sec in enumerate(data["sections"]):
         parts.append('<div class="section-block">')
         header = f'<span class="section-letter">{sec["label"]}</span>'
         if sec["name"]:
@@ -1098,7 +1121,7 @@ with preview_col:
         parts.append(f'<div class="section-header">{header}</div>')
 
         measures = sec["measures"]
-        key_changes = sec.get("key_changes", [None] * len(measures))
+        sec_mods = _modulations[sec_idx]
         n = len(measures)
         for row_start in range(0, n, 4):
             row = measures[row_start : row_start + 4]
@@ -1119,17 +1142,9 @@ with preview_col:
                         f'<div class="repeat-end"><span class="count">×{sec["repeats"]}</span>'
                         '<div class="dots"><span></span><span></span></div><div class="bar"></div></div>'
                     )
-                mod_key = None
-                if data["input_mode"] == "roman":
-                    kc = key_changes[gi] if gi < len(key_changes) else None
-                    if kc is not None:
-                        _running_shift = kc
-                        mod_key = shift_key(data.get("publish_key", "C"), _running_shift)
-                        marks += f'<div class="key-change">→ {mod_key} ({_running_shift:+d})</div>'
-                effective_key = (
-                    (data.get("publish_key", "C") if _running_shift == 0 else shift_key(data.get("publish_key", "C"), _running_shift))
-                    if data["input_mode"] == "roman" else None
-                )
+                effective_key, pivot_shift = sec_mods[gi]
+                if pivot_shift is not None:
+                    marks += f'<div class="key-change">→ {effective_key} ({pivot_shift:+d})</div>'
                 parts.append(
                     f'<div class="measure-box" style="border-left:1.5px solid {INK};border-right:{border_right};'
                     f'padding-left:{pad_l}px;padding-right:{pad_r}px;">'
@@ -1207,9 +1222,9 @@ def build_pdf(data: dict, parse_mode: str) -> bytes:
 
     box_w = (width - 2 * margin) / 4
     box_h = 0.55 * inch
-    running_shift = 0  # persists across sections, same as the on-screen preview
+    modulations = compute_modulations(data)
 
-    for sec in data["sections"]:
+    for sec_idx, sec in enumerate(data["sections"]):
         if y < margin + box_h * 2:
             c.showPage()
             _paint_page_background()
@@ -1226,7 +1241,7 @@ def build_pdf(data: dict, parse_mode: str) -> bytes:
         y -= box_h
 
         measures = sec["measures"]
-        key_changes = sec.get("key_changes", [None] * len(measures))
+        sec_mods = modulations[sec_idx]
         n = len(measures)
         for row_start in range(0, n, 4):
             if y < margin:
@@ -1239,18 +1254,12 @@ def build_pdf(data: dict, parse_mode: str) -> bytes:
                 bx = x + i * box_w
                 c.setLineWidth(1)
                 c.rect(bx, y, box_w, box_h)
-                if data["input_mode"] == "roman":
-                    kc = key_changes[gi] if gi < len(key_changes) else None
-                    if kc is not None:
-                        running_shift = kc
-                        mod_key = shift_key(data.get("publish_key", "C"), running_shift)
-                        c.setFont(PDF_FONT_LABEL, 7)
-                        c.setFillColorRGB(0.48, 0.18, 0.18)
-                        c.drawRightString(bx + box_w - 3, y + box_h - 9, f"\u2192 {mod_key} ({running_shift:+d})")
-                        c.setFillColorRGB(*fg_rgb)
-                    effective_key = data.get("publish_key", "C") if running_shift == 0 else shift_key(data.get("publish_key", "C"), running_shift)
-                else:
-                    effective_key = None
+                effective_key, pivot_shift = sec_mods[gi]
+                if pivot_shift is not None:
+                    c.setFont(PDF_FONT_LABEL, 7)
+                    c.setFillColorRGB(0.48, 0.18, 0.18)
+                    c.drawRightString(bx + box_w - 3, y + box_h - 9, f"\u2192 {effective_key} ({pivot_shift:+d})")
+                    c.setFillColorRGB(*fg_rgb)
                 render_chord_pdf(c, resolve_display_text(text, effective_key), bx, y, box_w, box_h, parse_mode)
             if sec["repeats"] > 1:
                 is_first_row = row_start == 0
