@@ -42,24 +42,22 @@ exported PDF:
   key, which occasionally differs by enharmonic spelling from a strict
   interval-preserving transposition.
 
-## Saving named chart files
+## Downloading and loading chart files
 
-Beyond the automatic session save, open **Save / load chart files** to:
+Open **Save / load chart files** to:
 
-- **Save** the current chart under a name and folder you choose. Leave off
-  an extension and it's saved as `.chord` (e.g. "My Song" → `My Song.chord`);
-  typing your own extension is respected as-is.
-- **Load** any `.chord` file back — pick one from a dropdown of files found
-  in the folder you specified, or paste a full file path to load from
-  anywhere else on disk.
-- **Download** the current chart, or any listed file, straight to your own
-  device's browser downloads — this works over the network even when the
-  app is deployed remotely, since it's a normal browser download rather
-  than a server-disk operation.
+- **Download JSON** — downloads the current chart as a `.chord` file to
+  your own device. The file name comes from the "File name" field (an
+  extension is added automatically if you don't include one).
+- **Load** a `.chord` file — pick one from a dropdown of files found in the
+  folder you specify (useful when running the app on your own machine), or
+  use the file picker below it to open a `.chord` file from anywhere else
+  on disk (a normal file-selection dialog, then tap **Load uploaded
+  file**).
 
-The folder is wherever this app is actually running: your own computer if
-you run it locally, or the host's storage if you've deployed it (see
-"Getting this onto your iPad" below for what that means for persistence).
+The folder field is only used for browsing and loading — there's no
+separate "save to disk" step; Download JSON is how you get a copy of the
+chart out of the app.
 
 ## Appearance and PDF font
 
