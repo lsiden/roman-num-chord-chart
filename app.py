@@ -806,22 +806,24 @@ def copy_section(sid: int, letter: str):
 
 
 def paste_measures_into(sid: int, at_1idx: int):
+    """Overwrites measures starting at at_1idx with the clipboard's content —
+    it never shifts or inserts. The section grows only if the pasted range
+    would otherwise run past its current end (capped at 64 measures)."""
     clip = st.session_state.get("clipboard")
     if not clip or clip["type"] != "measures":
         return
     texts = clip["data"]
     kchanges = clip.get("key_changes", [None] * len(texts))
     n = st.session_state[f"mcount_{sid}"]
-    old_texts = [st.session_state.get(f"m_{sid}_{i}", "") for i in range(n)]
-    old_keys = [get_key_change(sid, i) for i in range(n)]
-    at = max(0, min(at_1idx - 1, n))
-    new_texts = (old_texts[:at] + list(texts) + old_texts[at:])[:64]
-    new_keys = (old_keys[:at] + list(kchanges) + old_keys[at:])[:64]
-    st.session_state[f"mcount_{sid}"] = len(new_texts)
-    for i, v in enumerate(new_texts):
-        st.session_state[f"m_{sid}_{i}"] = v
-    for i, v in enumerate(new_keys):
-        set_key_change(sid, i, v)
+    at = max(0, at_1idx - 1)
+    new_n = min(64, max(n, at + len(texts)))
+    st.session_state[f"mcount_{sid}"] = new_n
+    for offset in range(len(texts)):
+        i = at + offset
+        if i >= new_n:
+            break
+        st.session_state[f"m_{sid}_{i}"] = texts[offset]
+        set_key_change(sid, i, kchanges[offset] if offset < len(kchanges) else None)
 
 
 def paste_section_after(after_sid):
@@ -1230,7 +1232,7 @@ for idx, sid in enumerate(list(st.session_state["section_order"])):
 
             with st.expander("Copy / paste"):
                 st.session_state[f"copyfrom_{sid}"] = min(st.session_state.get(f"copyfrom_{sid}", 1), n)
-                st.session_state[f"copyto_{sid}"] = min(st.session_state.get(f"copyto_{sid}", n), n)
+                st.session_state[f"copyto_{sid}"] = min(st.session_state.get(f"copyto_{sid}", min(8, n)), n)
                 cp1, cp2, cp3 = st.columns([1, 1, 1.4])
                 with cp1:
                     st.number_input("From m.", min_value=1, max_value=n, key=f"copyfrom_{sid}")
@@ -1255,10 +1257,10 @@ for idx, sid in enumerate(list(st.session_state["section_order"])):
 
                 clip = st.session_state.get("clipboard")
                 if clip and clip["type"] == "measures":
-                    st.session_state[f"pasteat_{sid}"] = min(st.session_state.get(f"pasteat_{sid}", n + 1), n + 1)
+                    st.session_state[f"pasteat_{sid}"] = min(st.session_state.get(f"pasteat_{sid}", 1), n + 1)
                     pp1, pp2 = st.columns([1, 1.4])
                     with pp1:
-                        st.number_input("Insert before m.", min_value=1, max_value=n + 1, key=f"pasteat_{sid}")
+                        st.number_input("Overwrite starting at m.", min_value=1, max_value=n + 1, key=f"pasteat_{sid}")
                     with pp2:
                         st.write("")
                         st.button(
