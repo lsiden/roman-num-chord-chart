@@ -22,25 +22,32 @@ Open **Input mode & publish settings** at the top to switch between:
 
 ## Publishing
 
-The same panel controls what actually gets shown in the chart and in the
-exported PDF:
+"Enter chords as" (input) and "Publish chart as" (output) are independent —
+any combination works, in both the on-screen chart and the exported PDF:
 
-- **Written in Roman numerals** → choose to publish as Roman numerals (as
-  typed) or as **chord names in a key you pick**. Handles triads, seventh
-  chords, standard inversions (6, 6/4, 6/5, 4/3, 4/2), and one level of
-  secondary dominant (e.g. `V7/V`). Anything unusual is shown as typed
+- **Roman numerals in, Roman numerals out** → shown exactly as typed.
+- **Roman numerals in, chord names out** → pick a key; handles triads,
+  seventh chords, standard inversions (6, 6/4, 6/5, 4/3, 4/2), and one level
+  of secondary dominant (e.g. `V7/V`). Anything unusual is shown as typed
   rather than guessed at. Any measure can carry a **key change**, a
   semitone shift from ±0 to ±6 relative to your chart's original key. Once
   set, it takes effect for that measure and every later measure — across
   section boundaries — until a different measure sets a new key change. A
   small "→ Eb (+3)" label marks the exact measure where each modulation
-  starts, in both the on-screen chart and the PDF.
-- **Written as chord names** → set the key the chart is written in and the
-  key you want to publish in; the app transposes every chord (including
-  slash-chord bass notes) automatically. Diatonic chords transpose exactly;
-  chromatic/borrowed chords use the closest simple spelling for the target
-  key, which occasionally differs by enharmonic spelling from a strict
-  interval-preserving transposition.
+  starts.
+- **Chord names in, chord names out** → set the key the chart is written in
+  and the key you want to publish in; the app transposes every chord
+  (including slash-chord bass notes) automatically. Diatonic chords
+  transpose exactly; chromatic/borrowed chords use the closest simple
+  spelling for the target key, which occasionally differs by enharmonic
+  spelling from a strict interval-preserving transposition.
+- **Chord names in, Roman numerals out** → set the key the chart is
+  written in; each chord is analyzed relative to that key (handles triads,
+  seventh chords, and standard inversions). Extensions the analyzer doesn't
+  recognize (sus4, add9, …) are read as a plain triad.
+
+Switching "Enter chords as" resets "Publish chart as" to match, as a
+sensible default — but you can then set them independently again.
 
 ## Downloading and loading chart files
 
