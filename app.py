@@ -961,7 +961,7 @@ with col_title:
     )
 
 with col_actions:
-    a, c1 = st.columns([2, 1])
+    a, b, c1 = st.columns([1.3, 1, 1])
     with a:
         if st.session_state.get("save_status") == "error":
             st.error(f"Couldn't save: {st.session_state.get('save_error', '')}", icon="⚠️")
@@ -969,6 +969,8 @@ with col_actions:
             st.caption(f"💾 Saved to disk at {st.session_state.get('save_time', '')}")
         else:
             st.caption("💾 Saving…")
+    with b:
+        st.button("Save now", on_click=save_to_disk, use_container_width=True)
     with c1:
         pdf_placeholder = st.container()
 
