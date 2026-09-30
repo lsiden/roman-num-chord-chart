@@ -1029,6 +1029,12 @@ with st.expander("Input mode & publish settings", expanded=False):
             )
 
     with settings_col:
+        # Always keep these set to a real key (default C) — several branches
+        # below read them even when their selectbox isn't the one currently
+        # rendered, and a missing value shouldn't ever silently break things.
+        st.session_state.setdefault("written_key", "C")
+        st.session_state.setdefault("publish_key", "C")
+
         st.radio(
             "Publish chart as",
             ["Roman numerals", "Chord names"],
@@ -1044,6 +1050,8 @@ with st.expander("Input mode & publish settings", expanded=False):
         if not publish_as_roman:
             st.selectbox("Key for chord names", MAJOR_KEYS, key="publish_key")
 
+        written_key = st.session_state.get("written_key", "C")
+        publish_key = st.session_state.get("publish_key", "C")
         if input_mode == "roman" and not publish_as_roman:
             st.caption(
                 "Converts triads, seventh chords, standard inversions (6, 6/4, 6/5, 4/3, 4/2), "
@@ -1051,13 +1059,13 @@ with st.expander("Input mode & publish settings", expanded=False):
             )
         elif input_mode == "name" and publish_as_roman:
             st.caption(
-                f"Analyzed relative to {st.session_state['written_key']} major. Handles triads, "
+                f"Analyzed relative to {written_key} major. Handles triads, "
                 "seventh chords, and standard inversions (6, 6/4, 6/5, 4/3, 4/2). Unusual "
                 "extensions (sus4, add9, …) are read as a plain triad."
             )
         elif input_mode == "name" and not publish_as_roman:
-            if st.session_state["written_key"] != st.session_state["publish_key"]:
-                st.caption(f"Transposing from {st.session_state['written_key']} to {st.session_state['publish_key']}.")
+            if written_key != publish_key:
+                st.caption(f"Transposing from {written_key} to {publish_key}.")
 
 # --------------------------------------------------------------------------
 # Save / load named chart files (separate from the automatic session autosave)
