@@ -1044,10 +1044,10 @@ with st.expander("Input mode & publish settings", expanded=False):
         input_mode = st.session_state["input_mode"]
         publish_as_roman = st.session_state["publish_display"] == "Roman numerals"
 
-        if input_mode == "name":
+        kcol1, kcol2 = st.columns(2)
+        with kcol1:
             st.selectbox("Chart is written in", MAJOR_KEYS, key="written_key")
-
-        if not publish_as_roman:
+        with kcol2:
             st.selectbox("Key for chord names", MAJOR_KEYS, key="publish_key")
 
         written_key = st.session_state.get("written_key", "C")
