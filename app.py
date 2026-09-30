@@ -932,6 +932,9 @@ st.markdown(
     .editor-card {{ background:{PAPER_CARD}; border:1px solid {RULE}; padding:14px; margin-bottom:14px; }}
     .editor-letter {{ display:inline-flex; align-items:center; justify-content:center; width:28px; height:28px; border:1.5px solid {INK};
                        font-family:'EB Garamond', serif; font-size:16px; color:{INK}; }}
+    .icon-btn-disabled {{ display:flex; align-items:center; justify-content:center; height:2.5rem;
+                           border:1px solid {RULE}; border-radius:0.5rem; color:{MUTED2}; font-size:15px;
+                           background:transparent; user-select:none; }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -1161,9 +1164,15 @@ for idx, sid in enumerate(list(st.session_state["section_order"])):
                     placeholder="Section name (optional) — Verse, Chorus…",
                 )
             with top[2]:
-                st.button("↑", key=f"up_{sid}", disabled=idx == 0, on_click=move_section, args=(sid, -1))
+                if idx == 0:
+                    st.markdown('<div class="icon-btn-disabled">↑</div>', unsafe_allow_html=True)
+                else:
+                    st.button("↑", key=f"up_{sid}", on_click=move_section, args=(sid, -1))
             with top[3]:
-                st.button("↓", key=f"down_{sid}", disabled=idx == len(st.session_state["section_order"]) - 1, on_click=move_section, args=(sid, 1))
+                if idx == len(st.session_state["section_order"]) - 1:
+                    st.markdown('<div class="icon-btn-disabled">↓</div>', unsafe_allow_html=True)
+                else:
+                    st.button("↓", key=f"down_{sid}", on_click=move_section, args=(sid, 1))
             with top[4]:
                 st.button("✕", key=f"del_{sid}", on_click=remove_section, args=(sid,))
 
