@@ -477,6 +477,103 @@ def roman_to_chord_name(token: str, key: str) -> str:
         return token  # anything we can't confidently parse is shown as-is
 
 
+# ---- chord name -> roman numeral (the reverse of the above) ----------------
+_ROMAN_NUMERAL_TEXT = {1: "I", 2: "II", 3: "III", 4: "IV", 5: "V", 6: "VI", 7: "VII"}
+# Reverse of _FIGURE_INFO's canonical entries: (bass_index, has_seventh) -> figure text.
+_FIGURE_REVERSE = {(0, False): "", (1, False): "6", (2, False): "6/4",
+                   (0, True): "7", (1, True): "6/5", (2, True): "4/3", (3, True): "4/2"}
+_BASE_INTERVALS = {"major": [0, 4, 7], "minor": [0, 3, 7], "dim": [0, 3, 6],
+                   "aug": [0, 4, 8], "halfdim": [0, 3, 6]}
+
+
+def parse_chord_name_quality(suffix: str):
+    """The mirror image of quality_to_suffix(): given what follows the root
+    (and precedes any /bass), returns (quality, has7, seventh_kind).
+    Unrecognized extensions (sus4, add9, ...) are treated as a plain triad —
+    the same scope limit roman_to_chord_name has in the other direction."""
+    s = suffix
+    low = s.lower()
+    if low.startswith("maj7"):
+        return "major", True, "maj7"
+    if low.startswith("m(maj7)"):
+        return "minor", True, "maj7"
+    if s.startswith("°7") or low.startswith("dim7"):
+        return "dim", True, None
+    if s.startswith("°") or low.startswith("dim"):
+        return "dim", False, None
+    if s.startswith("ø"):
+        return "halfdim", True, None
+    if s.startswith("+7"):
+        return "aug", True, None
+    if s.startswith("+") or low.startswith("aug"):
+        return "aug", False, None
+    if low.startswith("m7") or s.startswith("-7"):
+        return "minor", True, None
+    if low.startswith("m") or s.startswith("-"):
+        return "minor", False, None
+    if s.startswith("7"):
+        return "major", True, None
+    return "major", False, None
+
+
+def chord_root_to_roman_degree(root_letter: str, root_semitone: int, key: str):
+    """Every one of the 7 natural letters appears in a key's major scale
+    exactly once, so this always finds a degree — chromatic roots come back
+    with a nonzero accidental shift relative to that degree's diatonic pitch."""
+    scale = major_scale(key)
+    for deg_idx in range(7):
+        if scale[deg_idx][0] == root_letter:
+            diff = (root_semitone - note_semitone(scale[deg_idx])) % 12
+            if diff > 6:
+                diff -= 12
+            return deg_idx + 1, diff
+    return 1, 0  # unreachable in practice
+
+
+def chord_name_to_roman(token: str, key: str) -> str:
+    try:
+        m = re.match(r"^[A-Ga-g][#b]?", token)
+        if not m:
+            return token
+        root = m.group(0)
+        root_semitone = note_semitone(root)
+        rest = token[len(m.group(0)):]
+
+        bass_root = None
+        if "/" in rest:
+            idx = rest.index("/")
+            after = rest[idx + 1 :]
+            bm = re.match(r"^[A-Ga-g][#b]?", after)
+            if bm and bm.group(0) == after:
+                bass_root, rest = after, rest[:idx]
+
+        quality, has7, seventh_kind = parse_chord_name_quality(rest)
+        if quality == "halfdim":
+            has7 = True
+
+        degree, acc_diff = chord_root_to_roman_degree(root[0].upper(), root_semitone, key)
+        numeral = _ROMAN_NUMERAL_TEXT[degree]
+        numeral = numeral if quality in ("major", "aug") else numeral.lower()
+        numeral = ("#" * acc_diff if acc_diff > 0 else "b" * (-acc_diff)) + numeral
+
+        bass_index = 0
+        if bass_root is not None and seventh_kind != "maj7":
+            ivals = list(_BASE_INTERVALS[quality])
+            if has7:
+                ivals.append(seventh_interval(quality, seventh_kind))
+            target = (note_semitone(bass_root) - root_semitone) % 12
+            for idx, iv in enumerate(ivals):
+                if iv == target:
+                    bass_index = idx
+                    break
+
+        quality_symbol = {"dim": "°", "halfdim": "ø", "aug": "+"}.get(quality, "")
+        figure = "Δ" if seventh_kind == "maj7" else _FIGURE_REVERSE.get((bass_index, has7), "7" if has7 else "")
+        return numeral + quality_symbol + figure
+    except Exception:
+        return token  # anything we can't confidently parse is shown as-is
+
+
 # ---- chord-name transposition ----------------------------------------------
 def transpose_note(note: str, from_key: str, to_key: str) -> str:
     scale_from = major_scale(from_key)
@@ -509,26 +606,30 @@ def transpose_chord_token(token: str, from_key: str, to_key: str) -> str:
 
 
 # ---- what to actually display, given the current mode/publish settings ----
+# Input mode (how you type) and publish mode (what's shown) are independent:
+# any combination of the two is valid, e.g. type chord names but publish as
+# Roman numerals, or vice versa.
 def current_display_parse_mode() -> str:
-    if st.session_state["input_mode"] == "roman" and st.session_state.get("publish_display") == "Roman numerals":
-        return "roman"
-    return "name"
+    return "roman" if st.session_state.get("publish_display") == "Roman numerals" else "name"
 
 
 def resolve_display_text(raw_text: str, roman_key: str = None) -> str:
     if not raw_text or not raw_text.strip():
         return raw_text
-    mode = st.session_state["input_mode"]
+    input_mode = st.session_state["input_mode"]
+    publish_as_roman = st.session_state.get("publish_display") == "Roman numerals"
     out = []
     for tok in raw_text.strip().split():
-        if mode == "roman" and st.session_state.get("publish_display") == "Chord names":
+        if input_mode == "roman" and not publish_as_roman:
             key = roman_key if roman_key is not None else st.session_state.get("publish_key", "C")
             out.append(roman_to_chord_name(tok, key))
-        elif mode == "name":
+        elif input_mode == "name" and publish_as_roman:
+            out.append(chord_name_to_roman(tok, st.session_state.get("written_key", "C")))
+        elif input_mode == "name" and not publish_as_roman:
             wk, pk = st.session_state.get("written_key", "C"), st.session_state.get("publish_key", "C")
             out.append(transpose_chord_token(tok, wk, pk))
         else:
-            out.append(tok)
+            out.append(tok)  # input_mode == "roman" and publish_as_roman: shown as typed
     return " ".join(out)
 
 
@@ -842,16 +943,27 @@ with st.expander("Appearance (colors & font)", expanded=False):
 # --------------------------------------------------------------------------
 # Input mode + publish/transpose settings
 # --------------------------------------------------------------------------
+def on_input_mode_change():
+    new_mode = "roman" if st.session_state["input_mode_radio"] == "Roman numerals" else "name"
+    prev_mode = st.session_state.get("input_mode", "roman")
+    st.session_state["input_mode"] = new_mode
+    if new_mode != prev_mode:
+        # Default the output to match on a mode switch (least surprise), but
+        # this is just a default — publish_display can still be changed
+        # independently afterward.
+        st.session_state["publish_display"] = "Roman numerals" if new_mode == "roman" else "Chord names"
+
+
 with st.expander("Input mode & publish settings", expanded=False):
     mode_col, settings_col = st.columns([1, 2])
     with mode_col:
-        mode_label = st.radio(
+        st.radio(
             "Enter chords as",
             ["Roman numerals", "Chord names"],
             index=0 if st.session_state["input_mode"] == "roman" else 1,
             key="input_mode_radio",
+            on_change=on_input_mode_change,
         )
-        st.session_state["input_mode"] = "roman" if mode_label == "Roman numerals" else "name"
         if st.session_state["input_mode"] == "roman":
             st.caption(
                 "e.g. V7, ii6, vii°7, V7/V — type the numeral then anything else; "
@@ -864,25 +976,33 @@ with st.expander("Input mode & publish settings", expanded=False):
             )
 
     with settings_col:
-        if st.session_state["input_mode"] == "roman":
-            st.radio(
-                "Publish chart as",
-                ["Roman numerals", "Chord names"],
-                key="publish_display",
-                horizontal=True,
+        st.radio(
+            "Publish chart as",
+            ["Roman numerals", "Chord names"],
+            key="publish_display",
+            horizontal=True,
+        )
+        input_mode = st.session_state["input_mode"]
+        publish_as_roman = st.session_state["publish_display"] == "Roman numerals"
+
+        if input_mode == "name":
+            st.selectbox("Chart is written in", MAJOR_KEYS, key="written_key")
+
+        if not publish_as_roman:
+            st.selectbox("Key for chord names", MAJOR_KEYS, key="publish_key")
+
+        if input_mode == "roman" and not publish_as_roman:
+            st.caption(
+                "Converts triads, seventh chords, standard inversions (6, 6/4, 6/5, 4/3, 4/2), "
+                "and one level of secondary dominant (e.g. V7/V). Anything else is shown as typed."
             )
-            if st.session_state["publish_display"] == "Chord names":
-                st.selectbox("Key for chord names", MAJOR_KEYS, key="publish_key")
-                st.caption(
-                    "Converts triads, seventh chords, standard inversions (6, 6/4, 6/5, 4/3, 4/2), "
-                    "and one level of secondary dominant (e.g. V7/V). Anything else is shown as typed."
-                )
-        else:
-            k1, k2 = st.columns(2)
-            with k1:
-                st.selectbox("Chart is written in", MAJOR_KEYS, key="written_key")
-            with k2:
-                st.selectbox("Publish in key", MAJOR_KEYS, key="publish_key")
+        elif input_mode == "name" and publish_as_roman:
+            st.caption(
+                f"Analyzed relative to {st.session_state['written_key']} major. Handles triads, "
+                "seventh chords, and standard inversions (6, 6/4, 6/5, 4/3, 4/2). Unusual "
+                "extensions (sus4, add9, …) are read as a plain triad."
+            )
+        elif input_mode == "name" and not publish_as_roman:
             if st.session_state["written_key"] != st.session_state["publish_key"]:
                 st.caption(f"Transposing from {st.session_state['written_key']} to {st.session_state['publish_key']}.")
 
