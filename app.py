@@ -295,6 +295,54 @@ def chord_html(text: str, mode: str) -> str:
     return "".join(pieces)
 
 
+def render_section_html(sec: dict, sec_mods: list, parse_mode: str) -> str:
+    """One section's measures as HTML — bar-lines, repeat marks, key-change
+    labels. Used both to lay a section's output next to its own editor and,
+    in principle, to build up a full chart."""
+    parts = ['<div class="section-block">']
+    header = f'<span class="section-letter">{sec["label"]}</span>'
+    if sec["name"]:
+        header += f'<span class="section-name">{html.escape(sec["name"].upper())}</span>'
+    if sec["repeats"] > 1:
+        header += f'<span class="section-repeat-note">play ×{sec["repeats"]}</span>'
+    header += '<span class="section-hr"></span>'
+    parts.append(f'<div class="section-header">{header}</div>')
+
+    measures = sec["measures"]
+    n = len(measures)
+    for row_start in range(0, n, 4):
+        row = measures[row_start : row_start + 4]
+        parts.append('<div class="system-row">')
+        for c, text in enumerate(row):
+            gi = row_start + c
+            is_first = gi == 0
+            is_last = gi == n - 1
+            is_row_end = c == len(row) - 1
+            border_right = ("3px" if is_last else "1.5px") + f" solid {INK}" if is_row_end else "none"
+            pad_l = 14 if (is_first and sec["repeats"] > 1) else 10
+            pad_r = 14 if (is_last and sec["repeats"] > 1) else 10
+            marks = ""
+            if is_first and sec["repeats"] > 1:
+                marks += '<div class="repeat-start"><div class="bar"></div><div class="dots"><span></span><span></span></div></div>'
+            if is_last and sec["repeats"] > 1:
+                marks += (
+                    f'<div class="repeat-end"><span class="count">×{sec["repeats"]}</span>'
+                    '<div class="dots"><span></span><span></span></div><div class="bar"></div></div>'
+                )
+            effective_key, pivot_shift = sec_mods[gi]
+            if pivot_shift is not None:
+                marks += f'<div class="key-change">→ {effective_key} ({pivot_shift:+d})</div>'
+            parts.append(
+                f'<div class="measure-box" style="border-left:1.5px solid {INK};border-right:{border_right};'
+                f'padding-left:{pad_l}px;padding-right:{pad_r}px;">'
+                f'<span class="measure-index">{gi + 1}</span>'
+                f'<span class="chord">{chord_html(resolve_display_text(text, effective_key), parse_mode)}</span>{marks}</div>'
+            )
+        parts.append("</div>")
+    parts.append("</div>")
+    return "".join(parts)
+
+
 # ---- note spelling helpers ------------------------------------------------
 def note_semitone(note: str) -> int:
     letter = note[0].upper()
@@ -1067,11 +1115,16 @@ with st.expander("Save / load chart files", expanded=False):
         (st.success if kind == "ok" else st.error)(f"{'Loaded' if kind == 'ok' else 'Could not load'}: {msg}")
 
 # --------------------------------------------------------------------------
-# Editor + preview
+# Editor + output — each section's output renders right next to its own
+# editor, so entering chords into a section further down the page doesn't
+# require scrolling back up to a separate preview.
 # --------------------------------------------------------------------------
-editor_col, preview_col = st.columns([2, 3])
+data = collect_data()
+_parse_mode = current_display_parse_mode()
+_modulations = compute_modulations(data)
 
-with editor_col:
+header_col1, header_col2 = st.columns([2, 3])
+with header_col1:
     st.text_area("Notes", key="notes", placeholder="Tempo, feel, dynamics, performance notes…", height=80)
 
     clip = st.session_state.get("clipboard")
@@ -1081,9 +1134,20 @@ with editor_col:
             st.caption(f"📋 Copied: {clip['desc']}")
         with cc2:
             st.button("Clear", key="clear_clip", on_click=clear_clipboard, use_container_width=True)
+with header_col2:
+    top_parts = [f'<div class="chart-paper"><div class="chart-title">{html.escape(data["title"])}</div>']
+    if data["notes"].strip():
+        top_parts.append(
+            '<div class="notes-box"><span class="notes-label">NOTES</span>'
+            f'<div class="notes-text">{html.escape(data["notes"])}</div></div>'
+        )
+    top_parts.append("</div>")
+    st.markdown("".join(top_parts), unsafe_allow_html=True)
 
-    for idx, sid in enumerate(list(st.session_state["section_order"])):
-        letter = chr(65 + idx)
+for idx, sid in enumerate(list(st.session_state["section_order"])):
+    letter = chr(65 + idx)
+    editor_col, preview_col = st.columns([2, 3])
+    with editor_col:
         with st.container():
             st.markdown('<div class="editor-card">', unsafe_allow_html=True)
             top = st.columns([0.6, 3.2, 0.5, 0.5, 0.5])
@@ -1207,75 +1271,22 @@ with editor_col:
 
             st.markdown("</div>", unsafe_allow_html=True)
 
-    st.button("＋ Add section", on_click=new_section, use_container_width=True)
-    clip = st.session_state.get("clipboard")
-    if clip and clip["type"] == "section":
-        st.button(
-            "＋ Paste as new section",
-            on_click=paste_section_after,
-            args=(None,),
-            use_container_width=True,
-        )
+    with preview_col:
+        # data/_modulations were collected once, before this loop, so every
+        # section's output here reflects the same snapshot as the PDF below.
+        sec_data = data["sections"][idx]
+        sec_html = render_section_html(sec_data, _modulations[idx], _parse_mode)
+        st.markdown(f'<div class="chart-paper">{sec_html}</div>', unsafe_allow_html=True)
 
-with preview_col:
-    data = collect_data()
-    _parse_mode = current_display_parse_mode()
-    _modulations = compute_modulations(data)
-
-    parts = [f'<div class="chart-paper"><div class="chart-title">{html.escape(data["title"])}</div>']
-
-    if data["notes"].strip():
-        parts.append(
-            '<div class="notes-box"><span class="notes-label">NOTES</span>'
-            f'<div class="notes-text">{html.escape(data["notes"])}</div></div>'
-        )
-
-    for sec_idx, sec in enumerate(data["sections"]):
-        parts.append('<div class="section-block">')
-        header = f'<span class="section-letter">{sec["label"]}</span>'
-        if sec["name"]:
-            header += f'<span class="section-name">{html.escape(sec["name"].upper())}</span>'
-        if sec["repeats"] > 1:
-            header += f'<span class="section-repeat-note">play ×{sec["repeats"]}</span>'
-        header += '<span class="section-hr"></span>'
-        parts.append(f'<div class="section-header">{header}</div>')
-
-        measures = sec["measures"]
-        sec_mods = _modulations[sec_idx]
-        n = len(measures)
-        for row_start in range(0, n, 4):
-            row = measures[row_start : row_start + 4]
-            parts.append('<div class="system-row">')
-            for c, text in enumerate(row):
-                gi = row_start + c
-                is_first = gi == 0
-                is_last = gi == n - 1
-                is_row_end = c == len(row) - 1
-                border_right = ("3px" if is_last else "1.5px") + f" solid {INK}" if is_row_end else "none"
-                pad_l = 14 if (is_first and sec["repeats"] > 1) else 10
-                pad_r = 14 if (is_last and sec["repeats"] > 1) else 10
-                marks = ""
-                if is_first and sec["repeats"] > 1:
-                    marks += '<div class="repeat-start"><div class="bar"></div><div class="dots"><span></span><span></span></div></div>'
-                if is_last and sec["repeats"] > 1:
-                    marks += (
-                        f'<div class="repeat-end"><span class="count">×{sec["repeats"]}</span>'
-                        '<div class="dots"><span></span><span></span></div><div class="bar"></div></div>'
-                    )
-                effective_key, pivot_shift = sec_mods[gi]
-                if pivot_shift is not None:
-                    marks += f'<div class="key-change">→ {effective_key} ({pivot_shift:+d})</div>'
-                parts.append(
-                    f'<div class="measure-box" style="border-left:1.5px solid {INK};border-right:{border_right};'
-                    f'padding-left:{pad_l}px;padding-right:{pad_r}px;">'
-                    f'<span class="measure-index">{gi + 1}</span>'
-                    f'<span class="chord">{chord_html(resolve_display_text(text, effective_key), _parse_mode)}</span>{marks}</div>'
-                )
-            parts.append("</div>")
-        parts.append("</div>")
-
-    parts.append("</div>")
-    st.markdown("".join(parts), unsafe_allow_html=True)
+st.button("＋ Add section", on_click=new_section, use_container_width=True)
+clip = st.session_state.get("clipboard")
+if clip and clip["type"] == "section":
+    st.button(
+        "＋ Paste as new section",
+        on_click=paste_section_after,
+        args=(None,),
+        use_container_width=True,
+    )
 
 # --------------------------------------------------------------------------
 # PDF export (this replaces the browser print button — it always works
