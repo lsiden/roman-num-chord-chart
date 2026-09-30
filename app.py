@@ -1429,3 +1429,2865 @@ with pdf_placeholder:
 # Autosave on every rerun (i.e. after every edit) — a plain file write,
 # so there's no browser permission to fail.
 save_to_disk()
+"""
+Chord Chart — a Roman-numeral chord chart writer.
+
+Run locally:      streamlit run app.py
+Deploy to iPad:    see README.md
+"""
+
+import html
+import json
+import re
+import textwrap
+from datetime import datetime
+from io import BytesIO
+from pathlib import Path
+
+import streamlit as st
+from reportlab.lib.pagesizes import letter as LETTER_SIZE
+from reportlab.lib.units import inch
+from reportlab.pdfbase.pdfmetrics import stringWidth
+from reportlab.pdfgen import canvas
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+# --------------------------------------------------------------------------
+# Realbook-style font for the PDF, if you supply one
+#
+# ReportLab only ships the 14 standard PDF fonts (Times, Helvetica, etc.) —
+# there's no built-in "Real Book" hand-lettered jazz font, and licensed
+# fonts (e.g. New Real Book Chords, LilyJAZZText, LeadSheet) can't be
+# bundled here. Drop a .ttf/.otf file you're licensed to use into a
+# "fonts" folder next to this script (see README) and it's picked up
+# automatically; otherwise the PDF falls back to Times Bold Italic.
+# --------------------------------------------------------------------------
+FONTS_DIR = Path(__file__).parent / "fonts"
+REALBOOK_FONT_NAME = "Realbook"
+REALBOOK_AVAILABLE = False
+REALBOOK_FONT_FILE = None
+for _candidate in (sorted(FONTS_DIR.glob("*.ttf")) + sorted(FONTS_DIR.glob("*.otf")) if FONTS_DIR.exists() else []):
+    try:
+        pdfmetrics.registerFont(TTFont(REALBOOK_FONT_NAME, str(_candidate)))
+        REALBOOK_AVAILABLE = True
+        REALBOOK_FONT_FILE = _candidate.name
+        break
+    except Exception:
+        continue
+
+PDF_FONT_TITLE = REALBOOK_FONT_NAME if REALBOOK_AVAILABLE else "Times-Bold"
+PDF_FONT_BODY = REALBOOK_FONT_NAME if REALBOOK_AVAILABLE else "Times-Italic"
+PDF_FONT_CHORD = REALBOOK_FONT_NAME if REALBOOK_AVAILABLE else "Times-BoldItalic"
+PDF_FONT_LABEL = REALBOOK_FONT_NAME if REALBOOK_AVAILABLE else "Helvetica-Bold"
+
+# --------------------------------------------------------------------------
+# Persistence
+#
+# Two independent layers:
+#   1. Autosave — a fixed JSON file next to this script, written after every
+#      edit, restored automatically on startup (chord_chart_save.json).
+#   2. Named files — charts you explicitly save under a name and folder you
+#      choose, with a ".chord" extension by default, and can reload later.
+#
+# Both are plain files on the disk of the machine running this script — no
+# browser storage, no JavaScript permissions required.
+# --------------------------------------------------------------------------
+DATA_FILE = Path(__file__).parent / "chord_chart_save.json"
+DEFAULT_CHART_FOLDER = Path(__file__).parent / "charts"
+
+
+def collect_data() -> dict:
+    sections = []
+    for i, sid in enumerate(st.session_state["section_order"]):
+        snap = _section_snapshot(sid)
+        snap["id"] = sid
+        snap["label"] = chr(65 + i)
+        snap["measure_count"] = len(snap["measures"])
+        sections.append(snap)
+    return {
+        "title": st.session_state.get("title", "Untitled Chart"),
+        "notes": st.session_state.get("notes", ""),
+        "input_mode": st.session_state.get("input_mode", "roman"),
+        "publish_display": st.session_state.get("publish_display", "Roman numerals"),
+        "written_key": st.session_state.get("written_key", "C"),
+        "publish_key": st.session_state.get("publish_key", "C"),
+        "bg_color": st.session_state.get("bg_color", "#EEEAE0"),
+        "fg_color": st.session_state.get("fg_color", "#2A241E"),
+        "sections": sections,
+    }
+
+
+def save_to_disk():
+    try:
+        DATA_FILE.write_text(
+            json.dumps(collect_data(), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        st.session_state["save_status"] = "saved"
+        st.session_state["save_time"] = datetime.now().strftime("%H:%M:%S")
+    except Exception as e:
+        st.session_state["save_status"] = "error"
+        st.session_state["save_error"] = str(e)
+
+
+def apply_chart_data(data: dict):
+    """Load a chart dict (however it was read) into session_state."""
+    st.session_state["title"] = data.get("title", "Untitled Chart")
+    st.session_state["notes"] = data.get("notes", "")
+    st.session_state["input_mode"] = data.get("input_mode", "roman")
+    st.session_state["publish_display"] = data.get("publish_display", "Roman numerals")
+    st.session_state["written_key"] = data.get("written_key", "C")
+    st.session_state["publish_key"] = data.get("publish_key", "C")
+    st.session_state["bg_color"] = data.get("bg_color", "#EEEAE0")
+    st.session_state["fg_color"] = data.get("fg_color", "#2A241E")
+
+    order = []
+    max_id = 0
+    for sec in data.get("sections", []):
+        sid = sec.get("id") or (max_id + 1)
+        max_id = max(max_id, sid)
+        order.append(sid)
+        st.session_state[f"name_{sid}"] = sec.get("name", "")
+        st.session_state[f"repeats_{sid}"] = sec.get("repeats", 1)
+        measures = sec.get("measures", [])
+        mc = sec.get("measure_count", len(measures) or 8)
+        st.session_state[f"mcount_{sid}"] = mc
+        for i in range(mc):
+            st.session_state[f"m_{sid}_{i}"] = measures[i] if i < len(measures) else ""
+
+        key_changes = sec.get("key_changes")
+        if key_changes is None:
+            # migrate from the older whole-section key_shift, if present
+            old_shift = sec.get("key_shift", 0)
+            key_changes = [old_shift if (old_shift and idx == 0) else None for idx in range(mc)]
+        for i in range(mc):
+            v = key_changes[i] if i < len(key_changes) else None
+            set_key_change(sid, i, v)
+    if order:
+        st.session_state["section_order"] = order
+        st.session_state["next_id"] = max_id + 1
+
+
+def load_from_disk():
+    if not DATA_FILE.exists():
+        return
+    try:
+        data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return  # corrupted or unreadable — keep the defaults already in session_state
+    apply_chart_data(data)
+
+
+def sanitize_filename(name: str) -> str:
+    name = re.sub(r'[^A-Za-z0-9 _-]', "", (name or "")).strip()
+    return name or "chart"
+
+
+def ensure_chord_filename(filename: str) -> str:
+    fname = filename.strip() or "chart"
+    if "." not in fname:
+        fname += ".chord"
+    return fname
+
+
+def list_chart_files(folder: str):
+    try:
+        folder_path = Path(folder).expanduser()
+        if not folder_path.exists():
+            return []
+        return sorted(p.name for p in folder_path.glob("*.chord"))
+    except Exception:
+        return []
+
+
+def load_chart_from_path(path_str: str):
+    try:
+        path = Path(path_str).expanduser()
+        data = json.loads(path.read_text(encoding="utf-8"))
+        apply_chart_data(data)
+        st.session_state["file_load_status"] = ("ok", str(path))
+    except Exception as e:
+        st.session_state["file_load_status"] = ("error", str(e))
+
+
+def load_chart_from_upload(uploaded_file):
+    try:
+        data = json.loads(uploaded_file.getvalue().decode("utf-8"))
+        apply_chart_data(data)
+        st.session_state["file_load_status"] = ("ok", uploaded_file.name)
+    except Exception as e:
+        st.session_state["file_load_status"] = ("error", str(e))
+
+
+
+
+# --------------------------------------------------------------------------
+# Chord parsing & music theory
+#
+#   "-7b5"  always becomes "ø"      (half-diminished)
+#   "^"     always becomes "Δ"      (major seventh) — NOT a separator
+#
+# Everything after the root (roman numeral or note letter) is superscripted
+# automatically, except a "/xyz" tail that names another chord/key/note
+# (secondary dominants, slash-bass chords) — that stays normal-sized.
+# --------------------------------------------------------------------------
+NOTE_TO_SEMITONE = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+LETTERS = "CDEFGAB"
+MAJOR_INTERVALS = [0, 2, 4, 5, 7, 9, 11]  # semitones of scale degrees 1..7
+FLAT_KEYS = {"F", "Bb", "Eb", "Ab", "Db", "Gb", "Cb"}
+MAJOR_KEYS = ["C", "G", "D", "A", "E", "B", "F#", "C#", "F", "Bb", "Eb", "Ab", "Db", "Gb", "Cb"]
+# Conventional single spelling per pitch class, used to name a modulation target.
+KEY_BY_SEMITONE = ["C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
+
+ROMAN_TO_DEGREE = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7}
+_ROMAN_PATTERN = re.compile(r"^([#b]*)(VII|vii|III|iii|VI|vi|IV|iv|II|ii|V|v|I|i)")
+
+
+def hex_to_rgb(hex_color: str):
+    h = hex_color.lstrip("#")
+    if len(h) == 3:
+        h = "".join(ch * 2 for ch in h)
+    return tuple(int(h[i : i + 2], 16) for i in (0, 2, 4))
+
+
+def hex_to_rgb01(hex_color: str):
+    r, g, b = hex_to_rgb(hex_color)
+    return r / 255, g / 255, b / 255
+
+
+def hex_to_rgba_css(hex_color: str, alpha: float) -> str:
+    r, g, b = hex_to_rgb(hex_color)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+SHARP_TO_FLAT = {"C#": "Db", "D#": "Eb", "E#": "F", "F#": "Gb", "G#": "Ab", "A#": "Bb", "B#": "C"}
+
+
+def apply_chord_shorthand(text: str) -> str:
+    if st.session_state.get("input_mode") == "name":
+        # "m" right after the root means minor, unless it's "maj": "gm" -> "g-",
+        # "gm7" -> "g-7", but "gmaj7" is left alone.
+        text = re.sub(r"(^|[\s/])([A-Ga-g][#b]?)m(?!aj)", lambda m: m.group(1) + m.group(2) + "-", text)
+    text = text.replace("-7b5", "ø")
+    text = text.replace("^", "Δ")
+    if st.session_state.get("input_mode") == "name":
+        # Capitalize the root/bass letter (start of a token, or right after
+        # "/"), leaving the accidental and everything else as typed:
+        # "bb7" -> "Bb7", "c7/e" -> "C7/E", "gm" -> "G-".
+        text = re.sub(r"(^|[\s/])([a-g])", lambda m: m.group(1) + m.group(2).upper(), text)
+        # Always prefer the flat spelling: "A#7" -> "Bb7".
+        text = re.sub(
+            r"(^|[\s/])([A-G]#)",
+            lambda m: m.group(1) + SHARP_TO_FLAT.get(m.group(2), m.group(2)),
+            text,
+        )
+    return text
+
+
+def split_slash_suffix(rest: str):
+    """Separate a trailing '/something' from the superscriptable part.
+    A '/' followed by a digit is a figured-bass inversion (e.g. 6/4) and
+    stays fully superscripted; a '/' followed by a letter names another
+    chord/note (secondary dominant, slash-bass) and is kept normal-sized."""
+    if "/" not in rest:
+        return rest, ""
+    idx = rest.index("/")
+    after = rest[idx + 1 :]
+    if after[:1].isdigit():
+        return rest, ""
+    return rest[:idx], rest[idx:]
+
+
+def parse_chord_token(token: str, mode: str):
+    if mode == "roman":
+        m = re.match(r"^[#b]*[nNivxIVX]+", token)
+    else:
+        m = re.match(r"^[A-Ga-g][#b]?", token)
+    if not m or len(m.group(0)) == 0 or len(m.group(0)) == len(token):
+        base, rest = token, ""
+    else:
+        base, rest = m.group(0), token[len(m.group(0)) :]
+    sup, slash = split_slash_suffix(rest)
+    return base, sup, slash
+
+
+def chord_html(text: str, mode: str) -> str:
+    if not text or not text.strip():
+        return ""
+    pieces = []
+    for tok in text.strip().split():
+        base, sup, slash = parse_chord_token(tok, mode)
+        base, sup, slash = html.escape(base), html.escape(sup), html.escape(slash)
+        piece = f"<span>{base}</span>"
+        if sup:
+            piece += f"<sup>{sup}</sup>"
+        if slash:
+            piece += f"<span>{slash}</span>"
+        pieces.append(f'<span class="chord-token">{piece}</span>')
+    return "".join(pieces)
+
+
+def render_section_html(sec: dict, sec_mods: list, parse_mode: str) -> str:
+    """One section's measures as HTML — bar-lines, repeat marks, key-change
+    labels. Used both to lay a section's output next to its own editor and,
+    in principle, to build up a full chart."""
+    parts = ['<div class="section-block">']
+    header = f'<span class="section-letter">{sec["label"]}</span>'
+    if sec["name"]:
+        header += f'<span class="section-name">{html.escape(sec["name"].upper())}</span>'
+    if sec["repeats"] > 1:
+        header += f'<span class="section-repeat-note">play ×{sec["repeats"]}</span>'
+    header += '<span class="section-hr"></span>'
+    parts.append(f'<div class="section-header">{header}</div>')
+
+    measures = sec["measures"]
+    n = len(measures)
+    for row_start in range(0, n, 4):
+        row = measures[row_start : row_start + 4]
+        parts.append('<div class="system-row">')
+        for c, text in enumerate(row):
+            gi = row_start + c
+            is_first = gi == 0
+            is_last = gi == n - 1
+            is_row_end = c == len(row) - 1
+            border_right = ("3px" if is_last else "1.5px") + f" solid {INK}" if is_row_end else "none"
+            pad_l = 14 if (is_first and sec["repeats"] > 1) else 10
+            pad_r = 14 if (is_last and sec["repeats"] > 1) else 10
+            marks = ""
+            if is_first and sec["repeats"] > 1:
+                marks += '<div class="repeat-start"><div class="bar"></div><div class="dots"><span></span><span></span></div></div>'
+            if is_last and sec["repeats"] > 1:
+                marks += (
+                    f'<div class="repeat-end"><span class="count">×{sec["repeats"]}</span>'
+                    '<div class="dots"><span></span><span></span></div><div class="bar"></div></div>'
+                )
+            effective_key, pivot_shift = sec_mods[gi]
+            if pivot_shift is not None:
+                marks += f'<div class="key-change">→ {effective_key} ({pivot_shift:+d})</div>'
+            parts.append(
+                f'<div class="measure-box" style="border-left:1.5px solid {INK};border-right:{border_right};'
+                f'padding-left:{pad_l}px;padding-right:{pad_r}px;">'
+                f'<span class="measure-index">{gi + 1}</span>'
+                f'<span class="chord">{chord_html(resolve_display_text(text, effective_key), parse_mode)}</span>{marks}</div>'
+            )
+        parts.append("</div>")
+    parts.append("</div>")
+    return "".join(parts)
+
+
+# ---- note spelling helpers ------------------------------------------------
+def note_semitone(note: str) -> int:
+    letter = note[0].upper()
+    acc = note[1:]
+    return (NOTE_TO_SEMITONE[letter] + acc.count("#") - acc.count("b")) % 12
+
+
+def spell_letter(letter: str, semitone: int) -> str:
+    natural = NOTE_TO_SEMITONE[letter]
+    diff = (semitone - natural) % 12
+    if diff > 6:
+        diff -= 12
+    if diff == 0:
+        return letter
+    return letter + ("#" * diff if diff > 0 else "b" * (-diff))
+
+
+def respell(semitone: int, prefer_flat: bool) -> str:
+    best = None
+    for L in LETTERS:
+        diff = (semitone - NOTE_TO_SEMITONE[L]) % 12
+        if diff > 6:
+            diff -= 12
+        cand = (abs(diff), L, diff)
+        if best is None or cand[0] < best[0] or (
+            cand[0] == best[0] and ((prefer_flat and cand[2] < best[2]) or (not prefer_flat and cand[2] > best[2]))
+        ):
+            best = cand
+    _, L, diff = best
+    return spell_letter(L, (NOTE_TO_SEMITONE[L] + diff) % 12)
+
+
+def major_scale(tonic: str):
+    letter = tonic[0].upper()
+    acc = tonic[1:]
+    tonic_semitone = note_semitone(letter + acc)
+    start = LETTERS.index(letter)
+    scale_letters = [LETTERS[(start + i) % 7] for i in range(7)]
+    return [spell_letter(scale_letters[i], (tonic_semitone + MAJOR_INTERVALS[i]) % 12) for i in range(7)]
+
+
+def shift_key(base_key: str, semitones: int) -> str:
+    return KEY_BY_SEMITONE[(note_semitone(base_key) + semitones) % 12]
+
+
+# ---- per-measure key changes (modulation) ----------------------------------
+# A measure may carry an explicit semitone shift (clamped to -6..+6). Once
+# set, it stays in effect for that measure and every later measure in the
+# chart, until a different measure sets a new one.
+NO_KEY_CHANGE = "–"
+KEY_CHANGE_OPTIONS = [NO_KEY_CHANGE] + list(range(-6, 7))
+
+
+def key_change_label(v) -> str:
+    if v == NO_KEY_CHANGE:
+        return NO_KEY_CHANGE
+    return "0" if v == 0 else f"{v:+d}"
+
+
+def get_key_change(sid: int, idx: int):
+    v = st.session_state.get(f"mkey_{sid}_{idx}", NO_KEY_CHANGE)
+    return None if v == NO_KEY_CHANGE else v
+
+
+def set_key_change(sid: int, idx: int, v):
+    v = NO_KEY_CHANGE if v is None else max(-6, min(6, int(v)))
+    st.session_state[f"mkey_{sid}_{idx}"] = v
+
+
+# ---- roman numeral -> chord name -------------------------------------------
+def parse_roman_root(token: str):
+    m = _ROMAN_PATTERN.match(token)
+    if not m:
+        return None
+    prefix, numeral = m.group(1), m.group(2)
+    shift = prefix.count("#") - prefix.count("b")
+    degree = ROMAN_TO_DEGREE[numeral.upper()]
+    is_upper = numeral[0].isupper()
+    return shift, degree, is_upper, len(m.group(0))
+
+
+_FIGURE_INFO = {"": (0, False), "6": (1, False), "6/4": (2, False), "7": (0, True),
+                "6/5": (1, True), "4/3": (2, True), "4/2": (3, True), "2": (3, True)}
+
+
+def resolve_figure(fig: str):
+    """Returns (bass_index, has_seventh, seventh_kind, unrecognized_tail)."""
+    if fig.startswith("Δ"):
+        return 0, True, "maj7", fig[1:]
+    if fig.lower().startswith("maj"):
+        tail = fig[3:]
+        return 0, True, "maj7", (tail[1:] if tail[:1] == "7" else tail)
+    info = _FIGURE_INFO.get(fig)
+    if info is not None:
+        return info[0], info[1], None, ""
+    return 0, False, None, fig  # unrecognized: root position, appended literally
+
+
+def quality_to_suffix(quality: str, has7: bool, seventh_kind: str) -> str:
+    if quality == "major":
+        if not has7:
+            return ""
+        return "maj7" if seventh_kind == "maj7" else "7"
+    if quality == "minor":
+        if not has7:
+            return "-"
+        return "-(maj7)" if seventh_kind == "maj7" else "-7"
+    if quality == "dim":
+        return "°7" if has7 else "°"
+    if quality == "halfdim":
+        return "ø7" if has7 else "ø"
+    if quality == "aug":
+        return "+7" if has7 else "+"
+    return ""
+
+
+def seventh_interval(quality: str, seventh_kind: str) -> int:
+    if seventh_kind == "maj7":
+        return 11
+    if quality == "dim":
+        return 9
+    return 10  # dominant / minor / half-diminished seventh
+
+
+def roman_to_chord_name(token: str, key: str) -> str:
+    try:
+        parsed = parse_roman_root(token)
+        if parsed is None:
+            return token
+        shift, degree, is_upper, consumed = parsed
+        rest = token[consumed:]
+
+        target_shift = target_degree = None
+        if "/" in rest:
+            idx = rest.index("/")
+            after = rest[idx + 1 :]
+            tgt = parse_roman_root(after)
+            if tgt is not None and tgt[3] == len(after):
+                target_shift, target_degree = tgt[0], tgt[1]
+                rest = rest[:idx]
+
+        quality = "major" if is_upper else "minor"
+        if rest.startswith("°"):
+            quality, rest = "dim", rest[1:]
+        elif rest.startswith("ø"):
+            quality, rest = "halfdim", rest[1:]
+        elif rest.startswith("+"):
+            quality, rest = "aug", rest[1:]
+
+        scale = major_scale(key)
+        if target_degree is not None:
+            t_letter = scale[target_degree - 1][0]
+            t_semitone = (note_semitone(scale[target_degree - 1]) + target_shift) % 12
+            letter = LETTERS[(LETTERS.index(t_letter) + (degree - 1)) % 7]
+            root_semitone = (t_semitone + MAJOR_INTERVALS[degree - 1] + shift) % 12
+        else:
+            letter = scale[degree - 1][0]
+            root_semitone = (note_semitone(scale[degree - 1]) + shift) % 12
+        root_spelled = spell_letter(letter, root_semitone)
+
+        bass_index, has7, seventh_kind, tail = resolve_figure(rest)
+        if quality == "halfdim":
+            has7, seventh_kind = True, "min7"
+
+        base_ivals = {"major": [0, 4, 7], "minor": [0, 3, 7], "dim": [0, 3, 6],
+                      "aug": [0, 4, 8], "halfdim": [0, 3, 6]}[quality]
+        ivals = list(base_ivals)
+        if has7:
+            ivals.append(seventh_interval(quality, seventh_kind))
+        bass_index = min(bass_index, len(ivals) - 1)
+        bass_semitone = (root_semitone + ivals[bass_index]) % 12
+        bass_letter = LETTERS[(LETTERS.index(letter) + 2 * bass_index) % 7]
+        bass_spelled = spell_letter(bass_letter, bass_semitone)
+
+        chord_str = root_spelled + quality_to_suffix(quality, has7, seventh_kind) + tail
+        if bass_index != 0:
+            chord_str += "/" + bass_spelled
+        return chord_str
+    except Exception:
+        return token  # anything we can't confidently parse is shown as-is
+
+
+# ---- chord name -> roman numeral (the reverse of the above) ----------------
+_ROMAN_NUMERAL_TEXT = {1: "I", 2: "II", 3: "III", 4: "IV", 5: "V", 6: "VI", 7: "VII"}
+# Reverse of _FIGURE_INFO's canonical entries: (bass_index, has_seventh) -> figure text.
+_FIGURE_REVERSE = {(0, False): "", (1, False): "6", (2, False): "6/4",
+                   (0, True): "7", (1, True): "6/5", (2, True): "4/3", (3, True): "4/2"}
+_BASE_INTERVALS = {"major": [0, 4, 7], "minor": [0, 3, 7], "dim": [0, 3, 6],
+                   "aug": [0, 4, 8], "halfdim": [0, 3, 6]}
+
+
+def parse_chord_name_quality(suffix: str):
+    """The mirror image of quality_to_suffix(): given what follows the root
+    (and precedes any /bass), returns (quality, has7, seventh_kind).
+    Unrecognized extensions (sus4, add9, ...) are treated as a plain triad —
+    the same scope limit roman_to_chord_name has in the other direction."""
+    s = suffix
+    low = s.lower()
+    if low.startswith("maj7"):
+        return "major", True, "maj7"
+    if low.startswith("m(maj7)"):
+        return "minor", True, "maj7"
+    if s.startswith("°7") or low.startswith("dim7"):
+        return "dim", True, None
+    if s.startswith("°") or low.startswith("dim"):
+        return "dim", False, None
+    if s.startswith("ø"):
+        return "halfdim", True, None
+    if s.startswith("+7"):
+        return "aug", True, None
+    if s.startswith("+") or low.startswith("aug"):
+        return "aug", False, None
+    if low.startswith("m7") or s.startswith("-7"):
+        return "minor", True, None
+    if low.startswith("m") or s.startswith("-"):
+        return "minor", False, None
+    if s.startswith("7"):
+        return "major", True, None
+    return "major", False, None
+
+
+def chord_root_to_roman_degree(root_letter: str, root_semitone: int, key: str):
+    """Every one of the 7 natural letters appears in a key's major scale
+    exactly once, so this always finds a degree — chromatic roots come back
+    with a nonzero accidental shift relative to that degree's diatonic pitch."""
+    scale = major_scale(key)
+    for deg_idx in range(7):
+        if scale[deg_idx][0] == root_letter:
+            diff = (root_semitone - note_semitone(scale[deg_idx])) % 12
+            if diff > 6:
+                diff -= 12
+            return deg_idx + 1, diff
+    return 1, 0  # unreachable in practice
+
+
+def chord_name_to_roman(token: str, key: str) -> str:
+    try:
+        m = re.match(r"^[A-Ga-g][#b]?", token)
+        if not m:
+            return token
+        root = m.group(0)
+        root_semitone = note_semitone(root)
+        rest = token[len(m.group(0)):]
+
+        bass_root = None
+        if "/" in rest:
+            idx = rest.index("/")
+            after = rest[idx + 1 :]
+            bm = re.match(r"^[A-Ga-g][#b]?", after)
+            if bm and bm.group(0) == after:
+                bass_root, rest = after, rest[:idx]
+
+        quality, has7, seventh_kind = parse_chord_name_quality(rest)
+        if quality == "halfdim":
+            has7 = True
+
+        degree, acc_diff = chord_root_to_roman_degree(root[0].upper(), root_semitone, key)
+        numeral = _ROMAN_NUMERAL_TEXT[degree]
+        numeral = numeral if quality in ("major", "aug") else numeral.lower()
+        numeral = ("#" * acc_diff if acc_diff > 0 else "b" * (-acc_diff)) + numeral
+
+        bass_index = 0
+        if bass_root is not None and seventh_kind != "maj7":
+            ivals = list(_BASE_INTERVALS[quality])
+            if has7:
+                ivals.append(seventh_interval(quality, seventh_kind))
+            target = (note_semitone(bass_root) - root_semitone) % 12
+            for idx, iv in enumerate(ivals):
+                if iv == target:
+                    bass_index = idx
+                    break
+
+        quality_symbol = {"dim": "°", "halfdim": "ø", "aug": "+"}.get(quality, "")
+        figure = "Δ" if seventh_kind == "maj7" else _FIGURE_REVERSE.get((bass_index, has7), "7" if has7 else "")
+        return numeral + quality_symbol + figure
+    except Exception:
+        return token  # anything we can't confidently parse is shown as-is
+
+
+# ---- chord-name transposition ----------------------------------------------
+def transpose_note(note: str, from_key: str, to_key: str) -> str:
+    scale_from = major_scale(from_key)
+    if note in scale_from:
+        return major_scale(to_key)[scale_from.index(note)]
+    shift = (note_semitone(to_key) - note_semitone(from_key)) % 12
+    target_semitone = (note_semitone(note) + shift) % 12
+    return respell(target_semitone, to_key in FLAT_KEYS)
+
+
+def transpose_chord_token(token: str, from_key: str, to_key: str) -> str:
+    if from_key == to_key:
+        return token
+    try:
+        m = re.match(r"^[A-Ga-g][#b]?", token)
+        if not m:
+            return token
+        root, rest = m.group(0), token[len(m.group(0)) :]
+        new_root = transpose_note(root, from_key, to_key)
+        if "/" in rest:
+            idx = rest.index("/")
+            pre, bass_part = rest[:idx], rest[idx + 1 :]
+            bm = re.match(r"^[A-Ga-g][#b]?", bass_part)
+            if bm:
+                new_bass = transpose_note(bm.group(0), from_key, to_key)
+                rest = pre + "/" + new_bass + bass_part[len(bm.group(0)) :]
+        return new_root + rest
+    except Exception:
+        return token
+
+
+# ---- what to actually display, given the current mode/publish settings ----
+# Input mode (how you type) and publish mode (what's shown) are independent:
+# any combination of the two is valid, e.g. type chord names but publish as
+# Roman numerals, or vice versa.
+def current_display_parse_mode() -> str:
+    return "roman" if st.session_state.get("publish_display") == "Roman numerals" else "name"
+
+
+def resolve_display_text(raw_text: str, roman_key: str = None) -> str:
+    if not raw_text or not raw_text.strip():
+        return raw_text
+    input_mode = st.session_state["input_mode"]
+    publish_as_roman = st.session_state.get("publish_display") == "Roman numerals"
+    out = []
+    for tok in raw_text.strip().split():
+        if input_mode == "roman" and not publish_as_roman:
+            key = roman_key if roman_key is not None else st.session_state.get("publish_key", "C")
+            out.append(roman_to_chord_name(tok, key))
+        elif input_mode == "name" and publish_as_roman:
+            out.append(chord_name_to_roman(tok, st.session_state.get("written_key", "C")))
+        elif input_mode == "name" and not publish_as_roman:
+            wk, pk = st.session_state.get("written_key", "C"), st.session_state.get("publish_key", "C")
+            out.append(transpose_chord_token(tok, wk, pk))
+        else:
+            out.append(tok)  # input_mode == "roman" and publish_as_roman: shown as typed
+    return " ".join(out)
+
+
+def compute_modulations(data: dict):
+    """Returns a list (parallel to data["sections"]) of per-measure
+    (effective_key, pivot_shift) pairs. pivot_shift is the value a measure
+    explicitly set there (None elsewhere and whenever not in roman mode);
+    effective_key is the key in force at that measure (None outside roman
+    mode). The shift persists across sections until a later measure resets
+    it, so this is computed once and shared by the preview and the PDF."""
+    is_roman = data["input_mode"] == "roman"
+    publish_key = data.get("publish_key", "C")
+    running_shift = 0
+    result = []
+    for sec in data["sections"]:
+        measures = sec["measures"]
+        key_changes = sec.get("key_changes", [None] * len(measures))
+        per_measure = []
+        for gi in range(len(measures)):
+            pivot_shift = key_changes[gi] if gi < len(key_changes) else None
+            if is_roman and pivot_shift is not None:
+                running_shift = pivot_shift
+            if is_roman:
+                effective_key = publish_key if running_shift == 0 else shift_key(publish_key, running_shift)
+            else:
+                effective_key = None
+            per_measure.append((effective_key, pivot_shift if is_roman else None))
+        result.append(per_measure)
+    return result
+
+
+# --------------------------------------------------------------------------
+# Section helpers
+# --------------------------------------------------------------------------
+def new_section(measure_count: int = 8):
+    sid = st.session_state["next_id"]
+    st.session_state["next_id"] += 1
+    st.session_state["section_order"].append(sid)
+    st.session_state[f"name_{sid}"] = ""
+    st.session_state[f"repeats_{sid}"] = 1
+    st.session_state[f"mcount_{sid}"] = measure_count
+    for i in range(measure_count):
+        st.session_state[f"m_{sid}_{i}"] = ""
+        set_key_change(sid, i, None)
+
+
+def remove_section(sid: int):
+    st.session_state["section_order"] = [s for s in st.session_state["section_order"] if s != sid]
+
+
+def move_section(sid: int, direction: int):
+    order = st.session_state["section_order"]
+    idx = order.index(sid)
+    target = idx + direction
+    if 0 <= target < len(order):
+        order[idx], order[target] = order[target], order[idx]
+
+
+def on_measure_count_change(sid: int):
+    n = st.session_state[f"mcount_{sid}"]
+    n = max(1, min(64, n))
+    st.session_state[f"mcount_{sid}"] = n
+    for i in range(n):
+        st.session_state.setdefault(f"m_{sid}_{i}", "")
+        st.session_state.setdefault(f"mkey_{sid}_{i}", NO_KEY_CHANGE)
+
+
+def on_measure_text_change(sid: int, idx: int):
+    key = f"m_{sid}_{idx}"
+    st.session_state[key] = apply_chord_shorthand(st.session_state[key])
+
+
+# --------------------------------------------------------------------------
+# Copy / paste — an in-app clipboard (session_state), since Streamlit has no
+# direct access to the system clipboard. Holds either a range of measures
+# or an entire section at a time.
+# --------------------------------------------------------------------------
+def _section_snapshot(sid: int) -> dict:
+    """Everything about a section except its id/order — used by copy and by
+    the autosave/file format alike."""
+    n = st.session_state[f"mcount_{sid}"]
+    return {
+        "name": st.session_state.get(f"name_{sid}", ""),
+        "repeats": st.session_state.get(f"repeats_{sid}", 1),
+        "measures": [st.session_state.get(f"m_{sid}_{i}", "") for i in range(n)],
+        "key_changes": [get_key_change(sid, i) for i in range(n)],
+    }
+
+
+def _apply_section_snapshot(sid: int, data: dict):
+    """Write a _section_snapshot()-shaped dict into a (possibly new) section."""
+    st.session_state[f"name_{sid}"] = data.get("name", "")
+    st.session_state[f"repeats_{sid}"] = data.get("repeats", 1)
+    measures = data.get("measures", [])
+    key_changes = data.get("key_changes", [None] * len(measures))
+    st.session_state[f"mcount_{sid}"] = len(measures)
+    for i, v in enumerate(measures):
+        st.session_state[f"m_{sid}_{i}"] = v
+    for i, v in enumerate(key_changes):
+        set_key_change(sid, i, v)
+
+
+def copy_measures(sid: int, letter: str, start_1idx: int, end_1idx: int):
+    n = st.session_state[f"mcount_{sid}"]
+    start = max(1, min(start_1idx, n)) - 1
+    end = max(1, min(end_1idx, n))
+    if end <= start:
+        return
+    texts = [st.session_state.get(f"m_{sid}_{i}", "") for i in range(start, end)]
+    key_changes = [get_key_change(sid, i) for i in range(start, end)]
+    st.session_state["clipboard"] = {
+        "type": "measures",
+        "data": texts,
+        "key_changes": key_changes,
+        "desc": f"{len(texts)} measure{'s' if len(texts) != 1 else ''} from section {letter} (m.{start + 1}–{end})",
+    }
+
+
+def copy_section(sid: int, letter: str):
+    n = st.session_state[f"mcount_{sid}"]
+    st.session_state["clipboard"] = {
+        "type": "section",
+        "data": _section_snapshot(sid),
+        "desc": f"section {letter} ({n} measures)",
+    }
+
+
+def paste_measures_into(sid: int, at_1idx: int):
+    clip = st.session_state.get("clipboard")
+    if not clip or clip["type"] != "measures":
+        return
+    texts = clip["data"]
+    kchanges = clip.get("key_changes", [None] * len(texts))
+    n = st.session_state[f"mcount_{sid}"]
+    old_texts = [st.session_state.get(f"m_{sid}_{i}", "") for i in range(n)]
+    old_keys = [get_key_change(sid, i) for i in range(n)]
+    at = max(0, min(at_1idx - 1, n))
+    new_texts = (old_texts[:at] + list(texts) + old_texts[at:])[:64]
+    new_keys = (old_keys[:at] + list(kchanges) + old_keys[at:])[:64]
+    st.session_state[f"mcount_{sid}"] = len(new_texts)
+    for i, v in enumerate(new_texts):
+        st.session_state[f"m_{sid}_{i}"] = v
+    for i, v in enumerate(new_keys):
+        set_key_change(sid, i, v)
+
+
+def paste_section_after(after_sid):
+    clip = st.session_state.get("clipboard")
+    if not clip or clip["type"] != "section":
+        return
+    new_sid = st.session_state["next_id"]
+    st.session_state["next_id"] += 1
+    _apply_section_snapshot(new_sid, clip["data"])
+    order = st.session_state["section_order"]
+    if after_sid is None:
+        order.append(new_sid)
+    else:
+        order.insert(order.index(after_sid) + 1, new_sid)
+
+
+def replace_section(sid: int):
+    clip = st.session_state.get("clipboard")
+    if not clip or clip["type"] != "section":
+        return
+    _apply_section_snapshot(sid, clip["data"])
+
+
+def clear_clipboard():
+    st.session_state["clipboard"] = None
+
+
+# --------------------------------------------------------------------------
+# Initial state
+# --------------------------------------------------------------------------
+if "initialized" not in st.session_state:
+    st.session_state["initialized"] = True
+    st.session_state["title"] = "Untitled Chart"
+    st.session_state["notes"] = ""
+    st.session_state["input_mode"] = "roman"
+    st.session_state["publish_display"] = "Roman numerals"
+    st.session_state["written_key"] = "C"
+    st.session_state["publish_key"] = "C"
+    st.session_state["file_folder"] = str(DEFAULT_CHART_FOLDER)
+    st.session_state["bg_color"] = "#EEEAE0"
+    st.session_state["fg_color"] = "#2A241E"
+    st.session_state["file_name"] = sanitize_filename(st.session_state["title"])
+    st.session_state["save_status"] = "idle"
+    st.session_state["clipboard"] = None
+    st.session_state["next_id"] = 2
+    st.session_state["section_order"] = [1]
+    st.session_state["name_1"] = ""
+    st.session_state["repeats_1"] = 1
+    st.session_state["mcount_1"] = 8
+    for i in range(8):
+        st.session_state[f"m_1_{i}"] = ""
+        set_key_change(1, i, None)
+    load_from_disk()  # pull in a previously saved chart, if one exists
+
+# --------------------------------------------------------------------------
+# Page setup + styling
+# --------------------------------------------------------------------------
+st.set_page_config(page_title="Chord Chart", layout="wide")
+
+INK = st.session_state.get("fg_color", "#2A241E")
+PAPER = st.session_state.get("bg_color", "#EEEAE0")
+ACCENT = "#7A2E2E"
+PAPER_CARD = PAPER
+RULE = hex_to_rgba_css(INK, 0.35)
+MUTED = hex_to_rgba_css(INK, 0.65)
+MUTED2 = hex_to_rgba_css(INK, 0.5)
+
+st.markdown(
+    f"""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,500;0,600;1,500;1,600&family=JetBrains+Mono:wght@400;500;600&display=swap');
+    .stApp {{ background: {PAPER}; }}
+    .block-container {{ padding-top: calc(2rem + 0.5in); max-width: 1200px; }}
+
+    .chart-paper {{ background: {PAPER}; border: 1px solid {RULE}; padding: 24px 28px; }}
+    .chart-title {{ font-family: 'EB Garamond', serif; font-weight: 600; font-size: 32px; color: {INK}; }}
+
+    .notes-box {{ margin-bottom: 26px; }}
+    .notes-label {{ display:block; margin-bottom:4px; font-family:'JetBrains Mono',monospace; font-size:10px; letter-spacing:0.08em; color:{MUTED2}; }}
+    .notes-text {{ font-family:'EB Garamond', serif; font-style:italic; font-size:15px; color:{INK}; border:1px solid {RULE}; background:{PAPER_CARD}; padding:8px 12px; white-space:pre-wrap; min-height: 1.4em; }}
+
+    .section-block {{ margin-bottom: 34px; }}
+    .section-header {{ display:flex; align-items:baseline; gap:12px; margin-bottom:8px; }}
+    .section-letter {{ font-family:'EB Garamond', serif; font-weight:600; font-size:24px; color:{INK}; }}
+    .section-name {{ font-family:'JetBrains Mono',monospace; font-size:12px; color:{MUTED}; letter-spacing:0.03em; }}
+    .section-repeat-note {{ font-family:'JetBrains Mono',monospace; font-size:11px; color:{ACCENT}; }}
+    .section-hr {{ flex:1; border-bottom:1px solid {RULE}; }}
+
+    .system-row {{ display:flex; }}
+    .measure-box {{ position:relative; flex:1; min-width:86px; min-height:60px; display:flex; align-items:center; justify-content:center;
+                    border-top:1.5px solid {INK}; border-bottom:1.5px solid {INK}; }}
+    .measure-index {{ position:absolute; top:3px; left:7px; font-family:'JetBrains Mono',monospace; font-size:9px; color:{RULE}; }}
+    .key-change {{ position:absolute; top:3px; right:7px; font-family:'JetBrains Mono',monospace; font-size:9px; font-weight:600; color:{ACCENT}; }}
+    .chord {{ font-family:'EB Garamond', serif; font-style:italic; font-size:21px; color:{INK}; }}
+    .chord-token {{ margin: 0 6px; white-space: nowrap; }}
+    .chord-token sup {{ font-size:0.6em; margin-left:1px; }}
+
+    .repeat-start, .repeat-end {{ position:absolute; top:0; bottom:0; display:flex; align-items:center; }}
+    .repeat-start {{ left:-2px; }}
+    .repeat-end {{ right:-2px; }}
+    .repeat-start .bar, .repeat-end .bar {{ width:4px; align-self:stretch; background:{ACCENT}; }}
+    .repeat-start .dots, .repeat-end .dots {{ display:flex; flex-direction:column; gap:5px; }}
+    .repeat-start .dots {{ margin-left:3px; }}
+    .repeat-end .dots {{ margin-right:3px; }}
+    .repeat-start .dots span, .repeat-end .dots span {{ width:5px; height:5px; border-radius:9999px; background:{ACCENT}; display:block; }}
+    .repeat-end .count {{ position:absolute; top:-18px; right:0; font-family:'JetBrains Mono',monospace; font-weight:600; font-size:11px; color:{ACCENT}; }}
+
+    .editor-card {{ background:{PAPER_CARD}; border:1px solid {RULE}; padding:14px; margin-bottom:14px; }}
+    .editor-letter {{ display:inline-flex; align-items:center; justify-content:center; width:28px; height:28px; border:1.5px solid {INK};
+                       font-family:'EB Garamond', serif; font-size:16px; color:{INK}; }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+def on_title_change():
+    if not st.session_state.get("file_name_touched", False):
+        st.session_state["file_name"] = sanitize_filename(st.session_state["title"])
+
+
+def on_filename_change():
+    st.session_state["file_name_touched"] = True
+
+
+# --------------------------------------------------------------------------
+# Header
+# --------------------------------------------------------------------------
+col_title, col_actions = st.columns([3, 2])
+
+with col_title:
+    st.text_input(
+        "Title", key="title", label_visibility="collapsed", placeholder="Chart title",
+        on_change=on_title_change,
+    )
+
+with col_actions:
+    a, c1 = st.columns([2, 1])
+    with a:
+        if st.session_state.get("save_status") == "error":
+            st.error(f"Couldn't save: {st.session_state.get('save_error', '')}", icon="⚠️")
+        elif st.session_state.get("save_status") == "saved":
+            st.caption(f"💾 Saved to disk at {st.session_state.get('save_time', '')}")
+        else:
+            st.caption("💾 Saving…")
+    with c1:
+        pdf_placeholder = st.container()
+
+# --------------------------------------------------------------------------
+# Appearance — background/foreground colors, for contrast
+# --------------------------------------------------------------------------
+with st.expander("Appearance (colors & font)", expanded=False):
+    ap1, ap2 = st.columns(2)
+    with ap1:
+        st.color_picker("Background color", key="bg_color")
+    with ap2:
+        st.color_picker("Text / line color", key="fg_color")
+    st.caption("Applies to the chart on screen and in the exported PDF.")
+    if REALBOOK_AVAILABLE:
+        st.caption(f"PDF font: using {REALBOOK_FONT_FILE} from the fonts folder.")
+    else:
+        st.caption(
+            "PDF font: no Realbook-style font found, so PDFs use Times Bold Italic. "
+            "Drop a .ttf/.otf you're licensed to use (e.g. MuseJazz) into a \"fonts\" "
+            "folder next to app.py to switch the PDF to that font."
+        )
+
+# --------------------------------------------------------------------------
+# Input mode + publish/transpose settings
+# --------------------------------------------------------------------------
+def on_input_mode_change():
+    new_mode = "roman" if st.session_state["input_mode_radio"] == "Roman numerals" else "name"
+    prev_mode = st.session_state.get("input_mode", "roman")
+    st.session_state["input_mode"] = new_mode
+    if new_mode != prev_mode:
+        # Default the output to match on a mode switch (least surprise), but
+        # this is just a default — publish_display can still be changed
+        # independently afterward.
+        st.session_state["publish_display"] = "Roman numerals" if new_mode == "roman" else "Chord names"
+
+
+with st.expander("Input mode & publish settings", expanded=False):
+    mode_col, settings_col = st.columns([1, 2])
+    with mode_col:
+        st.radio(
+            "Enter chords as",
+            ["Roman numerals", "Chord names"],
+            index=0 if st.session_state["input_mode"] == "roman" else 1,
+            key="input_mode_radio",
+            on_change=on_input_mode_change,
+        )
+        if st.session_state["input_mode"] == "roman":
+            st.caption(
+                "e.g. V7, ii6, vii°7, V7/V — type the numeral then anything else; "
+                "it's superscripted automatically. \"^\" always means major 7th (Δ)."
+            )
+        else:
+            st.caption(
+                "e.g. E7, Ab^ (= Ab major 7), Dm7, C/E — type the root then anything else; "
+                "it's superscripted automatically. \"^\" always means major 7th (Δ)."
+            )
+
+    with settings_col:
+        st.radio(
+            "Publish chart as",
+            ["Roman numerals", "Chord names"],
+            key="publish_display",
+            horizontal=True,
+        )
+        input_mode = st.session_state["input_mode"]
+        publish_as_roman = st.session_state["publish_display"] == "Roman numerals"
+
+        if input_mode == "name":
+            st.selectbox("Chart is written in", MAJOR_KEYS, key="written_key")
+
+        if not publish_as_roman:
+            st.selectbox("Key for chord names", MAJOR_KEYS, key="publish_key")
+
+        if input_mode == "roman" and not publish_as_roman:
+            st.caption(
+                "Converts triads, seventh chords, standard inversions (6, 6/4, 6/5, 4/3, 4/2), "
+                "and one level of secondary dominant (e.g. V7/V). Anything else is shown as typed."
+            )
+        elif input_mode == "name" and publish_as_roman:
+            st.caption(
+                f"Analyzed relative to {st.session_state['written_key']} major. Handles triads, "
+                "seventh chords, and standard inversions (6, 6/4, 6/5, 4/3, 4/2). Unusual "
+                "extensions (sus4, add9, …) are read as a plain triad."
+            )
+        elif input_mode == "name" and not publish_as_roman:
+            if st.session_state["written_key"] != st.session_state["publish_key"]:
+                st.caption(f"Transposing from {st.session_state['written_key']} to {st.session_state['publish_key']}.")
+
+# --------------------------------------------------------------------------
+# Save / load named chart files (separate from the automatic session autosave)
+# --------------------------------------------------------------------------
+with st.expander("Save / load chart files", expanded=False):
+    st.caption(
+        "Download saves a \".chord\" file to your device. The folder below is "
+        "only used to browse and load files already sitting on whichever "
+        "machine is running this app."
+    )
+    fc1, fc2 = st.columns([2, 1])
+    with fc1:
+        st.text_input("Folder", key="file_folder")
+    with fc2:
+        st.text_input("File name", key="file_name", on_change=on_filename_change)
+
+    st.download_button(
+        "⬇ Download JSON",
+        data=json.dumps(collect_data(), ensure_ascii=False, indent=2),
+        file_name=ensure_chord_filename(st.session_state["file_name"]),
+        mime="application/json",
+    )
+
+    st.divider()
+
+    files = list_chart_files(st.session_state["file_folder"])
+    if files:
+        if st.session_state.get("file_pick") not in files:
+            st.session_state["file_pick"] = files[0]
+        st.selectbox("Chart files in this folder", files, key="file_pick")
+        lc1, lc2 = st.columns(2)
+        with lc1:
+            st.button(
+                "📂 Load selected file", key="load_named_file",
+                on_click=load_chart_from_path,
+                args=(str(Path(st.session_state["file_folder"]).expanduser() / st.session_state["file_pick"]),),
+                use_container_width=True,
+            )
+        with lc2:
+            try:
+                selected_bytes = (Path(st.session_state["file_folder"]).expanduser() / st.session_state["file_pick"]).read_bytes()
+            except Exception:
+                selected_bytes = b""
+            st.download_button(
+                "⬇ Download this file", data=selected_bytes, file_name=st.session_state["file_pick"],
+                mime="application/json", use_container_width=True,
+            )
+    else:
+        st.caption("No .chord files found in that folder yet.")
+
+    uploaded = st.file_uploader("…or pick a file to load", type=["chord"], key="chart_upload")
+    if uploaded is not None:
+        st.button(
+            "📂 Load uploaded file", key="load_uploaded_file",
+            on_click=load_chart_from_upload, args=(uploaded,),
+        )
+    load_status = st.session_state.get("file_load_status")
+    if load_status:
+        kind, msg = load_status
+        (st.success if kind == "ok" else st.error)(f"{'Loaded' if kind == 'ok' else 'Could not load'}: {msg}")
+
+# --------------------------------------------------------------------------
+# Editor + output — each section's output renders right next to its own
+# editor, so entering chords into a section further down the page doesn't
+# require scrolling back up to a separate preview.
+# --------------------------------------------------------------------------
+data = collect_data()
+_parse_mode = current_display_parse_mode()
+_modulations = compute_modulations(data)
+
+header_col1, header_col2 = st.columns([2, 3])
+with header_col1:
+    st.text_area("Notes", key="notes", placeholder="Tempo, feel, dynamics, performance notes…", height=80)
+
+    clip = st.session_state.get("clipboard")
+    if clip:
+        cc1, cc2 = st.columns([4, 1])
+        with cc1:
+            st.caption(f"📋 Copied: {clip['desc']}")
+        with cc2:
+            st.button("Clear", key="clear_clip", on_click=clear_clipboard, use_container_width=True)
+with header_col2:
+    top_parts = [f'<div class="chart-paper"><div class="chart-title">{html.escape(data["title"])}</div>']
+    if data["notes"].strip():
+        top_parts.append(
+            '<div class="notes-box"><span class="notes-label">NOTES</span>'
+            f'<div class="notes-text">{html.escape(data["notes"])}</div></div>'
+        )
+    top_parts.append("</div>")
+    st.markdown("".join(top_parts), unsafe_allow_html=True)
+
+for idx, sid in enumerate(list(st.session_state["section_order"])):
+    letter = chr(65 + idx)
+    editor_col, preview_col = st.columns([2, 3])
+    with editor_col:
+        with st.container():
+            st.markdown('<div class="editor-card">', unsafe_allow_html=True)
+            top = st.columns([0.6, 3.2, 0.5, 0.5, 0.5])
+            with top[0]:
+                st.markdown(f'<span class="editor-letter">{letter}</span>', unsafe_allow_html=True)
+            with top[1]:
+                st.text_input(
+                    "Section name",
+                    key=f"name_{sid}",
+                    label_visibility="collapsed",
+                    placeholder="Section name (optional) — Verse, Chorus…",
+                )
+            with top[2]:
+                st.button("↑", key=f"up_{sid}", disabled=idx == 0, on_click=move_section, args=(sid, -1))
+            with top[3]:
+                st.button("↓", key=f"down_{sid}", disabled=idx == len(st.session_state["section_order"]) - 1, on_click=move_section, args=(sid, 1))
+            with top[4]:
+                st.button("✕", key=f"del_{sid}", on_click=remove_section, args=(sid,))
+
+            m1, m2 = st.columns(2)
+            with m1:
+                st.number_input(
+                    "Measures", min_value=1, max_value=64, key=f"mcount_{sid}",
+                    on_change=on_measure_count_change, args=(sid,),
+                )
+            with m2:
+                st.number_input("Repeat ×", min_value=1, max_value=20, key=f"repeats_{sid}")
+
+            if st.session_state["input_mode"] == "roman":
+                st.caption("Roman-numeral mode: set a key change on any measure below to modulate from there on.")
+
+            n = st.session_state[f"mcount_{sid}"]
+            for row_start in range(0, n, 4):
+                row_end = min(row_start + 4, n)
+                show_row_keys = True
+                if st.session_state["input_mode"] == "roman":
+                    row_toggle_key = f"showkey_{sid}_{row_start}"
+                    st.session_state.setdefault(row_toggle_key, False)
+                    st.toggle(f"Key changes for m.{row_start + 1}–{row_end}", key=row_toggle_key)
+                    show_row_keys = st.session_state[row_toggle_key]
+
+                cols = st.columns(4)
+                for c in range(4):
+                    i = row_start + c
+                    if i >= n:
+                        continue
+                    with cols[c]:
+                        st.caption(f"m.{i + 1}")
+                        st.text_input(
+                            f"measure {i}", key=f"m_{sid}_{i}", label_visibility="collapsed",
+                            placeholder=("V7" if st.session_state["input_mode"] == "roman" else "E7"),
+                            on_change=on_measure_text_change, args=(sid, i),
+                        )
+                        if st.session_state["input_mode"] == "roman":
+                            st.session_state.setdefault(f"mkey_{sid}_{i}", NO_KEY_CHANGE)
+                            if show_row_keys:
+                                st.selectbox(
+                                    f"key change m.{i}", options=KEY_CHANGE_OPTIONS,
+                                    format_func=key_change_label, key=f"mkey_{sid}_{i}",
+                                    label_visibility="collapsed",
+                                )
+
+            with st.expander("Copy / paste"):
+                st.session_state[f"copyfrom_{sid}"] = min(st.session_state.get(f"copyfrom_{sid}", 1), n)
+                st.session_state[f"copyto_{sid}"] = min(st.session_state.get(f"copyto_{sid}", n), n)
+                cp1, cp2, cp3 = st.columns([1, 1, 1.4])
+                with cp1:
+                    st.number_input("From m.", min_value=1, max_value=n, key=f"copyfrom_{sid}")
+                with cp2:
+                    st.number_input("To m.", min_value=1, max_value=n, key=f"copyto_{sid}")
+                with cp3:
+                    st.write("")
+                    st.button(
+                        "Copy measures",
+                        key=f"copymeasures_{sid}",
+                        use_container_width=True,
+                        on_click=copy_measures,
+                        args=(sid, letter, st.session_state[f"copyfrom_{sid}"], st.session_state[f"copyto_{sid}"]),
+                    )
+                st.button(
+                    "Copy whole section",
+                    key=f"copysection_{sid}",
+                    use_container_width=True,
+                    on_click=copy_section,
+                    args=(sid, letter),
+                )
+
+                clip = st.session_state.get("clipboard")
+                if clip and clip["type"] == "measures":
+                    st.session_state[f"pasteat_{sid}"] = min(st.session_state.get(f"pasteat_{sid}", n + 1), n + 1)
+                    pp1, pp2 = st.columns([1, 1.4])
+                    with pp1:
+                        st.number_input("Insert before m.", min_value=1, max_value=n + 1, key=f"pasteat_{sid}")
+                    with pp2:
+                        st.write("")
+                        st.button(
+                            "Paste measures",
+                            key=f"pastemeasures_{sid}",
+                            use_container_width=True,
+                            on_click=paste_measures_into,
+                            args=(sid, st.session_state[f"pasteat_{sid}"]),
+                        )
+                elif clip and clip["type"] == "section":
+                    pp1, pp2 = st.columns(2)
+                    with pp1:
+                        st.button(
+                            "Paste as new section after",
+                            key=f"pasteafter_{sid}",
+                            use_container_width=True,
+                            on_click=paste_section_after,
+                            args=(sid,),
+                        )
+                    with pp2:
+                        st.button(
+                            "Replace this section",
+                            key=f"pastereplace_{sid}",
+                            use_container_width=True,
+                            on_click=replace_section,
+                            args=(sid,),
+                        )
+
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    with preview_col:
+        # data/_modulations were collected once, before this loop, so every
+        # section's output here reflects the same snapshot as the PDF below.
+        sec_data = data["sections"][idx]
+        sec_html = render_section_html(sec_data, _modulations[idx], _parse_mode)
+        st.markdown(f'<div class="chart-paper">{sec_html}</div>', unsafe_allow_html=True)
+
+st.button("＋ Add section", on_click=new_section, use_container_width=True)
+clip = st.session_state.get("clipboard")
+if clip and clip["type"] == "section":
+    st.button(
+        "＋ Paste as new section",
+        on_click=paste_section_after,
+        args=(None,),
+        use_container_width=True,
+    )
+
+# --------------------------------------------------------------------------
+# PDF export (this replaces the browser print button — it always works
+# because the file is generated in Python, not via the browser)
+# --------------------------------------------------------------------------
+def render_chord_pdf(c: canvas.Canvas, text: str, bx: float, by: float, bw: float, bh: float, mode: str):
+    if not text or not text.strip():
+        return
+    pieces = [parse_chord_token(tok, mode) for tok in text.strip().split()]
+    base_font, sup_font, base_size, sup_size = PDF_FONT_CHORD, PDF_FONT_CHORD, 15, 9
+    seg_widths = []
+    for base, sup, slash in pieces:
+        w = stringWidth(base, base_font, base_size)
+        if sup:
+            w += stringWidth(sup, sup_font, sup_size) + 1
+        if slash:
+            w += stringWidth(slash, base_font, base_size)
+        seg_widths.append(w)
+    total = sum(seg_widths) + 8 * max(0, len(pieces) - 1)
+    curx = bx + bw / 2 - total / 2
+    cy = by + bh / 2 - 4
+    for (base, sup, slash), w in zip(pieces, seg_widths):
+        c.setFont(base_font, base_size)
+        c.drawString(curx, cy, base)
+        curx += stringWidth(base, base_font, base_size)
+        if sup:
+            c.setFont(sup_font, sup_size)
+            c.drawString(curx + 1, cy + 6, sup)
+            curx += stringWidth(sup, sup_font, sup_size) + 1
+        if slash:
+            c.setFont(base_font, base_size)
+            c.drawString(curx, cy, slash)
+            curx += stringWidth(slash, base_font, base_size)
+        curx += 8
+
+
+def build_pdf(data: dict, parse_mode: str) -> bytes:
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=LETTER_SIZE)
+    width, height = LETTER_SIZE
+    margin = 0.6 * inch
+    x, y = margin, height - margin
+
+    bg_rgb = hex_to_rgb01(data.get("bg_color", "#EEEAE0"))
+    fg_rgb = hex_to_rgb01(data.get("fg_color", "#2A241E"))
+
+    def _paint_page_background():
+        c.setFillColorRGB(*bg_rgb)
+        c.rect(0, 0, width, height, fill=1, stroke=0)
+        c.setFillColorRGB(*fg_rgb)
+        c.setStrokeColorRGB(*fg_rgb)
+
+    _paint_page_background()
+
+    c.setFont(PDF_FONT_TITLE, 20)
+    c.drawString(x, y, data["title"] or "Untitled Chart")
+    y -= 20
+    if data["notes"].strip():
+        c.setFont(PDF_FONT_BODY, 10)
+        for line in textwrap.wrap(data["notes"], 95) or [""]:
+            c.drawString(x, y, line)
+            y -= 13
+        y -= 6
+
+    box_w = (width - 2 * margin) / 4
+    box_h = 0.55 * inch
+    modulations = compute_modulations(data)
+
+    for sec_idx, sec in enumerate(data["sections"]):
+        if y < margin + box_h * 2:
+            c.showPage()
+            _paint_page_background()
+            y = height - margin
+        c.setFont(PDF_FONT_TITLE, 13)
+        label = sec["label"]
+        if sec["name"]:
+            label += "   " + sec["name"].upper()
+        if sec["repeats"] > 1:
+            label += f"   (play x{sec['repeats']})"
+        c.drawString(x, y, label)
+        y -= 6
+        c.line(x, y, width - margin, y)
+        y -= box_h
+
+        measures = sec["measures"]
+        sec_mods = modulations[sec_idx]
+        n = len(measures)
+        for row_start in range(0, n, 4):
+            if y < margin:
+                c.showPage()
+                _paint_page_background()
+                y = height - margin
+            row = measures[row_start : row_start + 4]
+            for i, text in enumerate(row):
+                gi = row_start + i
+                bx = x + i * box_w
+                c.setLineWidth(1)
+                c.rect(bx, y, box_w, box_h)
+                effective_key, pivot_shift = sec_mods[gi]
+                if pivot_shift is not None:
+                    c.setFont(PDF_FONT_LABEL, 7)
+                    c.setFillColorRGB(0.48, 0.18, 0.18)
+                    c.drawRightString(bx + box_w - 3, y + box_h - 9, f"\u2192 {effective_key} ({pivot_shift:+d})")
+                    c.setFillColorRGB(*fg_rgb)
+                render_chord_pdf(c, resolve_display_text(text, effective_key), bx, y, box_w, box_h, parse_mode)
+            if sec["repeats"] > 1:
+                is_first_row = row_start == 0
+                is_last_row = row_start + 4 >= n
+                c.setStrokeColorRGB(0.48, 0.18, 0.18)
+                if is_first_row:
+                    c.setLineWidth(3)
+                    c.line(x, y, x, y + box_h)
+                if is_last_row:
+                    end_x = x + len(row) * box_w
+                    c.setLineWidth(3)
+                    c.line(end_x, y, end_x, y + box_h)
+                    c.setFont(PDF_FONT_LABEL, 9)
+                    c.setFillColorRGB(0.48, 0.18, 0.18)
+                    c.drawRightString(end_x, y + box_h + 4, f"x{sec['repeats']}")
+                    c.setFillColorRGB(*fg_rgb)
+                c.setLineWidth(1)
+                c.setStrokeColorRGB(*fg_rgb)
+            y -= box_h
+        y -= 18
+
+    c.save()
+    buf.seek(0)
+    return buf.getvalue()
+
+
+with pdf_placeholder:
+    st.download_button(
+        "⬇ PDF",
+        data=build_pdf(data, _parse_mode),
+        file_name=f"{(data['title'] or 'chord-chart').strip().replace(' ', '-')}.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
+
+# Autosave on every rerun (i.e. after every edit) — a plain file write,
+# so there's no browser permission to fail.
+save_to_disk()
+"""
+Chord Chart — a Roman-numeral chord chart writer.
+
+Run locally:      streamlit run app.py
+Deploy to iPad:    see README.md
+"""
+
+import html
+import json
+import re
+import textwrap
+from datetime import datetime
+from io import BytesIO
+from pathlib import Path
+
+import streamlit as st
+from reportlab.lib.pagesizes import letter as LETTER_SIZE
+from reportlab.lib.units import inch
+from reportlab.pdfbase.pdfmetrics import stringWidth
+from reportlab.pdfgen import canvas
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+# --------------------------------------------------------------------------
+# Realbook-style font for the PDF, if you supply one
+#
+# ReportLab only ships the 14 standard PDF fonts (Times, Helvetica, etc.) —
+# there's no built-in "Real Book" hand-lettered jazz font, and licensed
+# fonts (e.g. New Real Book Chords, LilyJAZZText, LeadSheet) can't be
+# bundled here. Drop a .ttf/.otf file you're licensed to use into a
+# "fonts" folder next to this script (see README) and it's picked up
+# automatically; otherwise the PDF falls back to Times Bold Italic.
+# --------------------------------------------------------------------------
+FONTS_DIR = Path(__file__).parent / "fonts"
+REALBOOK_FONT_NAME = "Realbook"
+REALBOOK_AVAILABLE = False
+REALBOOK_FONT_FILE = None
+for _candidate in (sorted(FONTS_DIR.glob("*.ttf")) + sorted(FONTS_DIR.glob("*.otf")) if FONTS_DIR.exists() else []):
+    try:
+        pdfmetrics.registerFont(TTFont(REALBOOK_FONT_NAME, str(_candidate)))
+        REALBOOK_AVAILABLE = True
+        REALBOOK_FONT_FILE = _candidate.name
+        break
+    except Exception:
+        continue
+
+PDF_FONT_TITLE = REALBOOK_FONT_NAME if REALBOOK_AVAILABLE else "Times-Bold"
+PDF_FONT_BODY = REALBOOK_FONT_NAME if REALBOOK_AVAILABLE else "Times-Italic"
+PDF_FONT_CHORD = REALBOOK_FONT_NAME if REALBOOK_AVAILABLE else "Times-BoldItalic"
+PDF_FONT_LABEL = REALBOOK_FONT_NAME if REALBOOK_AVAILABLE else "Helvetica-Bold"
+
+# --------------------------------------------------------------------------
+# Persistence
+#
+# Two independent layers:
+#   1. Autosave — a fixed JSON file next to this script, written after every
+#      edit, restored automatically on startup (chord_chart_save.json).
+#   2. Named files — charts you explicitly save under a name and folder you
+#      choose, with a ".chord" extension by default, and can reload later.
+#
+# Both are plain files on the disk of the machine running this script — no
+# browser storage, no JavaScript permissions required.
+# --------------------------------------------------------------------------
+DATA_FILE = Path(__file__).parent / "chord_chart_save.json"
+DEFAULT_CHART_FOLDER = Path(__file__).parent / "charts"
+
+
+def collect_data() -> dict:
+    sections = []
+    for i, sid in enumerate(st.session_state["section_order"]):
+        snap = _section_snapshot(sid)
+        snap["id"] = sid
+        snap["label"] = chr(65 + i)
+        snap["measure_count"] = len(snap["measures"])
+        sections.append(snap)
+    return {
+        "title": st.session_state.get("title", "Untitled Chart"),
+        "notes": st.session_state.get("notes", ""),
+        "input_mode": st.session_state.get("input_mode", "roman"),
+        "publish_display": st.session_state.get("publish_display", "Roman numerals"),
+        "written_key": st.session_state.get("written_key", "C"),
+        "publish_key": st.session_state.get("publish_key", "C"),
+        "bg_color": st.session_state.get("bg_color", "#EEEAE0"),
+        "fg_color": st.session_state.get("fg_color", "#2A241E"),
+        "sections": sections,
+    }
+
+
+def save_to_disk():
+    try:
+        DATA_FILE.write_text(
+            json.dumps(collect_data(), ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        st.session_state["save_status"] = "saved"
+        st.session_state["save_time"] = datetime.now().strftime("%H:%M:%S")
+    except Exception as e:
+        st.session_state["save_status"] = "error"
+        st.session_state["save_error"] = str(e)
+
+
+def apply_chart_data(data: dict):
+    """Load a chart dict (however it was read) into session_state."""
+    st.session_state["title"] = data.get("title", "Untitled Chart")
+    st.session_state["notes"] = data.get("notes", "")
+    st.session_state["input_mode"] = data.get("input_mode", "roman")
+    st.session_state["publish_display"] = data.get("publish_display", "Roman numerals")
+    st.session_state["written_key"] = data.get("written_key", "C")
+    st.session_state["publish_key"] = data.get("publish_key", "C")
+    st.session_state["bg_color"] = data.get("bg_color", "#EEEAE0")
+    st.session_state["fg_color"] = data.get("fg_color", "#2A241E")
+
+    order = []
+    max_id = 0
+    for sec in data.get("sections", []):
+        sid = sec.get("id") or (max_id + 1)
+        max_id = max(max_id, sid)
+        order.append(sid)
+        st.session_state[f"name_{sid}"] = sec.get("name", "")
+        st.session_state[f"repeats_{sid}"] = sec.get("repeats", 1)
+        measures = sec.get("measures", [])
+        mc = sec.get("measure_count", len(measures) or 8)
+        st.session_state[f"mcount_{sid}"] = mc
+        for i in range(mc):
+            st.session_state[f"m_{sid}_{i}"] = measures[i] if i < len(measures) else ""
+
+        key_changes = sec.get("key_changes")
+        if key_changes is None:
+            # migrate from the older whole-section key_shift, if present
+            old_shift = sec.get("key_shift", 0)
+            key_changes = [old_shift if (old_shift and idx == 0) else None for idx in range(mc)]
+        for i in range(mc):
+            v = key_changes[i] if i < len(key_changes) else None
+            set_key_change(sid, i, v)
+    if order:
+        st.session_state["section_order"] = order
+        st.session_state["next_id"] = max_id + 1
+
+
+def load_from_disk():
+    if not DATA_FILE.exists():
+        return
+    try:
+        data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return  # corrupted or unreadable — keep the defaults already in session_state
+    apply_chart_data(data)
+
+
+def sanitize_filename(name: str) -> str:
+    name = re.sub(r'[^A-Za-z0-9 _-]', "", (name or "")).strip()
+    return name or "chart"
+
+
+def ensure_chord_filename(filename: str) -> str:
+    fname = filename.strip() or "chart"
+    if "." not in fname:
+        fname += ".chord"
+    return fname
+
+
+def list_chart_files(folder: str):
+    try:
+        folder_path = Path(folder).expanduser()
+        if not folder_path.exists():
+            return []
+        return sorted(p.name for p in folder_path.glob("*.chord"))
+    except Exception:
+        return []
+
+
+def load_chart_from_path(path_str: str):
+    try:
+        path = Path(path_str).expanduser()
+        data = json.loads(path.read_text(encoding="utf-8"))
+        apply_chart_data(data)
+        st.session_state["file_load_status"] = ("ok", str(path))
+    except Exception as e:
+        st.session_state["file_load_status"] = ("error", str(e))
+
+
+def load_chart_from_upload(uploaded_file):
+    try:
+        data = json.loads(uploaded_file.getvalue().decode("utf-8"))
+        apply_chart_data(data)
+        st.session_state["file_load_status"] = ("ok", uploaded_file.name)
+    except Exception as e:
+        st.session_state["file_load_status"] = ("error", str(e))
+
+
+
+
+# --------------------------------------------------------------------------
+# Chord parsing & music theory
+#
+#   "-7b5"  always becomes "ø"      (half-diminished)
+#   "^"     always becomes "Δ"      (major seventh) — NOT a separator
+#
+# Everything after the root (roman numeral or note letter) is superscripted
+# automatically, except a "/xyz" tail that names another chord/key/note
+# (secondary dominants, slash-bass chords) — that stays normal-sized.
+# --------------------------------------------------------------------------
+NOTE_TO_SEMITONE = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+LETTERS = "CDEFGAB"
+MAJOR_INTERVALS = [0, 2, 4, 5, 7, 9, 11]  # semitones of scale degrees 1..7
+FLAT_KEYS = {"F", "Bb", "Eb", "Ab", "Db", "Gb", "Cb"}
+MAJOR_KEYS = ["C", "G", "D", "A", "E", "B", "F#", "C#", "F", "Bb", "Eb", "Ab", "Db", "Gb", "Cb"]
+# Conventional single spelling per pitch class, used to name a modulation target.
+KEY_BY_SEMITONE = ["C", "Db", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
+
+ROMAN_TO_DEGREE = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7}
+_ROMAN_PATTERN = re.compile(r"^([#b]*)(VII|vii|III|iii|VI|vi|IV|iv|II|ii|V|v|I|i)")
+
+
+def hex_to_rgb(hex_color: str):
+    h = hex_color.lstrip("#")
+    if len(h) == 3:
+        h = "".join(ch * 2 for ch in h)
+    return tuple(int(h[i : i + 2], 16) for i in (0, 2, 4))
+
+
+def hex_to_rgb01(hex_color: str):
+    r, g, b = hex_to_rgb(hex_color)
+    return r / 255, g / 255, b / 255
+
+
+def hex_to_rgba_css(hex_color: str, alpha: float) -> str:
+    r, g, b = hex_to_rgb(hex_color)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+SHARP_TO_FLAT = {"C#": "Db", "D#": "Eb", "E#": "F", "F#": "Gb", "G#": "Ab", "A#": "Bb", "B#": "C"}
+
+
+def apply_chord_shorthand(text: str) -> str:
+    if st.session_state.get("input_mode") == "name":
+        # "m" right after the root means minor, unless it's "maj": "gm" -> "g-",
+        # "gm7" -> "g-7", but "gmaj7" is left alone.
+        text = re.sub(r"(^|[\s/])([A-Ga-g][#b]?)m(?!aj)", lambda m: m.group(1) + m.group(2) + "-", text)
+    text = text.replace("-7b5", "ø")
+    text = text.replace("^", "Δ")
+    if st.session_state.get("input_mode") == "name":
+        # Capitalize the root/bass letter (start of a token, or right after
+        # "/"), leaving the accidental and everything else as typed:
+        # "bb7" -> "Bb7", "c7/e" -> "C7/E", "gm" -> "G-".
+        text = re.sub(r"(^|[\s/])([a-g])", lambda m: m.group(1) + m.group(2).upper(), text)
+        # Always prefer the flat spelling: "A#7" -> "Bb7".
+        text = re.sub(
+            r"(^|[\s/])([A-G]#)",
+            lambda m: m.group(1) + SHARP_TO_FLAT.get(m.group(2), m.group(2)),
+            text,
+        )
+    return text
+
+
+def split_slash_suffix(rest: str):
+    """Separate a trailing '/something' from the superscriptable part.
+    A '/' followed by a digit is a figured-bass inversion (e.g. 6/4) and
+    stays fully superscripted; a '/' followed by a letter names another
+    chord/note (secondary dominant, slash-bass) and is kept normal-sized."""
+    if "/" not in rest:
+        return rest, ""
+    idx = rest.index("/")
+    after = rest[idx + 1 :]
+    if after[:1].isdigit():
+        return rest, ""
+    return rest[:idx], rest[idx:]
+
+
+def parse_chord_token(token: str, mode: str):
+    if mode == "roman":
+        m = re.match(r"^[#b]*[nNivxIVX]+", token)
+    else:
+        m = re.match(r"^[A-Ga-g][#b]?", token)
+    if not m or len(m.group(0)) == 0 or len(m.group(0)) == len(token):
+        base, rest = token, ""
+    else:
+        base, rest = m.group(0), token[len(m.group(0)) :]
+    sup, slash = split_slash_suffix(rest)
+    return base, sup, slash
+
+
+def chord_html(text: str, mode: str) -> str:
+    if not text or not text.strip():
+        return ""
+    pieces = []
+    for tok in text.strip().split():
+        base, sup, slash = parse_chord_token(tok, mode)
+        base, sup, slash = html.escape(base), html.escape(sup), html.escape(slash)
+        piece = f"<span>{base}</span>"
+        if sup:
+            piece += f"<sup>{sup}</sup>"
+        if slash:
+            piece += f"<span>{slash}</span>"
+        pieces.append(f'<span class="chord-token">{piece}</span>')
+    return "".join(pieces)
+
+
+def render_section_html(sec: dict, sec_mods: list, parse_mode: str) -> str:
+    """One section's measures as HTML — bar-lines, repeat marks, key-change
+    labels. Used both to lay a section's output next to its own editor and,
+    in principle, to build up a full chart."""
+    parts = ['<div class="section-block">']
+    header = f'<span class="section-letter">{sec["label"]}</span>'
+    if sec["name"]:
+        header += f'<span class="section-name">{html.escape(sec["name"].upper())}</span>'
+    if sec["repeats"] > 1:
+        header += f'<span class="section-repeat-note">play ×{sec["repeats"]}</span>'
+    header += '<span class="section-hr"></span>'
+    parts.append(f'<div class="section-header">{header}</div>')
+
+    measures = sec["measures"]
+    n = len(measures)
+    for row_start in range(0, n, 4):
+        row = measures[row_start : row_start + 4]
+        parts.append('<div class="system-row">')
+        for c, text in enumerate(row):
+            gi = row_start + c
+            is_first = gi == 0
+            is_last = gi == n - 1
+            is_row_end = c == len(row) - 1
+            border_right = ("3px" if is_last else "1.5px") + f" solid {INK}" if is_row_end else "none"
+            pad_l = 14 if (is_first and sec["repeats"] > 1) else 10
+            pad_r = 14 if (is_last and sec["repeats"] > 1) else 10
+            marks = ""
+            if is_first and sec["repeats"] > 1:
+                marks += '<div class="repeat-start"><div class="bar"></div><div class="dots"><span></span><span></span></div></div>'
+            if is_last and sec["repeats"] > 1:
+                marks += (
+                    f'<div class="repeat-end"><span class="count">×{sec["repeats"]}</span>'
+                    '<div class="dots"><span></span><span></span></div><div class="bar"></div></div>'
+                )
+            effective_key, pivot_shift = sec_mods[gi]
+            if pivot_shift is not None:
+                marks += f'<div class="key-change">→ {effective_key} ({pivot_shift:+d})</div>'
+            parts.append(
+                f'<div class="measure-box" style="border-left:1.5px solid {INK};border-right:{border_right};'
+                f'padding-left:{pad_l}px;padding-right:{pad_r}px;">'
+                f'<span class="measure-index">{gi + 1}</span>'
+                f'<span class="chord">{chord_html(resolve_display_text(text, effective_key), parse_mode)}</span>{marks}</div>'
+            )
+        parts.append("</div>")
+    parts.append("</div>")
+    return "".join(parts)
+
+
+# ---- note spelling helpers ------------------------------------------------
+def note_semitone(note: str) -> int:
+    letter = note[0].upper()
+    acc = note[1:]
+    return (NOTE_TO_SEMITONE[letter] + acc.count("#") - acc.count("b")) % 12
+
+
+def spell_letter(letter: str, semitone: int) -> str:
+    natural = NOTE_TO_SEMITONE[letter]
+    diff = (semitone - natural) % 12
+    if diff > 6:
+        diff -= 12
+    if diff == 0:
+        return letter
+    return letter + ("#" * diff if diff > 0 else "b" * (-diff))
+
+
+def respell(semitone: int, prefer_flat: bool) -> str:
+    best = None
+    for L in LETTERS:
+        diff = (semitone - NOTE_TO_SEMITONE[L]) % 12
+        if diff > 6:
+            diff -= 12
+        cand = (abs(diff), L, diff)
+        if best is None or cand[0] < best[0] or (
+            cand[0] == best[0] and ((prefer_flat and cand[2] < best[2]) or (not prefer_flat and cand[2] > best[2]))
+        ):
+            best = cand
+    _, L, diff = best
+    return spell_letter(L, (NOTE_TO_SEMITONE[L] + diff) % 12)
+
+
+def major_scale(tonic: str):
+    letter = tonic[0].upper()
+    acc = tonic[1:]
+    tonic_semitone = note_semitone(letter + acc)
+    start = LETTERS.index(letter)
+    scale_letters = [LETTERS[(start + i) % 7] for i in range(7)]
+    return [spell_letter(scale_letters[i], (tonic_semitone + MAJOR_INTERVALS[i]) % 12) for i in range(7)]
+
+
+def shift_key(base_key: str, semitones: int) -> str:
+    return KEY_BY_SEMITONE[(note_semitone(base_key) + semitones) % 12]
+
+
+# ---- per-measure key changes (modulation) ----------------------------------
+# A measure may carry an explicit semitone shift (clamped to -6..+6). Once
+# set, it stays in effect for that measure and every later measure in the
+# chart, until a different measure sets a new one.
+NO_KEY_CHANGE = "–"
+KEY_CHANGE_OPTIONS = [NO_KEY_CHANGE] + list(range(-6, 7))
+
+
+def key_change_label(v) -> str:
+    if v == NO_KEY_CHANGE:
+        return NO_KEY_CHANGE
+    return "0" if v == 0 else f"{v:+d}"
+
+
+def get_key_change(sid: int, idx: int):
+    v = st.session_state.get(f"mkey_{sid}_{idx}", NO_KEY_CHANGE)
+    return None if v == NO_KEY_CHANGE else v
+
+
+def set_key_change(sid: int, idx: int, v):
+    v = NO_KEY_CHANGE if v is None else max(-6, min(6, int(v)))
+    st.session_state[f"mkey_{sid}_{idx}"] = v
+
+
+# ---- roman numeral -> chord name -------------------------------------------
+def parse_roman_root(token: str):
+    m = _ROMAN_PATTERN.match(token)
+    if not m:
+        return None
+    prefix, numeral = m.group(1), m.group(2)
+    shift = prefix.count("#") - prefix.count("b")
+    degree = ROMAN_TO_DEGREE[numeral.upper()]
+    is_upper = numeral[0].isupper()
+    return shift, degree, is_upper, len(m.group(0))
+
+
+_FIGURE_INFO = {"": (0, False), "6": (1, False), "6/4": (2, False), "7": (0, True),
+                "6/5": (1, True), "4/3": (2, True), "4/2": (3, True), "2": (3, True)}
+
+
+def resolve_figure(fig: str):
+    """Returns (bass_index, has_seventh, seventh_kind, unrecognized_tail)."""
+    if fig.startswith("Δ"):
+        return 0, True, "maj7", fig[1:]
+    if fig.lower().startswith("maj"):
+        tail = fig[3:]
+        return 0, True, "maj7", (tail[1:] if tail[:1] == "7" else tail)
+    info = _FIGURE_INFO.get(fig)
+    if info is not None:
+        return info[0], info[1], None, ""
+    return 0, False, None, fig  # unrecognized: root position, appended literally
+
+
+def quality_to_suffix(quality: str, has7: bool, seventh_kind: str) -> str:
+    if quality == "major":
+        if not has7:
+            return ""
+        return "maj7" if seventh_kind == "maj7" else "7"
+    if quality == "minor":
+        if not has7:
+            return "-"
+        return "-(maj7)" if seventh_kind == "maj7" else "-7"
+    if quality == "dim":
+        return "°7" if has7 else "°"
+    if quality == "halfdim":
+        return "ø7" if has7 else "ø"
+    if quality == "aug":
+        return "+7" if has7 else "+"
+    return ""
+
+
+def seventh_interval(quality: str, seventh_kind: str) -> int:
+    if seventh_kind == "maj7":
+        return 11
+    if quality == "dim":
+        return 9
+    return 10  # dominant / minor / half-diminished seventh
+
+
+def roman_to_chord_name(token: str, key: str) -> str:
+    try:
+        parsed = parse_roman_root(token)
+        if parsed is None:
+            return token
+        shift, degree, is_upper, consumed = parsed
+        rest = token[consumed:]
+
+        target_shift = target_degree = None
+        if "/" in rest:
+            idx = rest.index("/")
+            after = rest[idx + 1 :]
+            tgt = parse_roman_root(after)
+            if tgt is not None and tgt[3] == len(after):
+                target_shift, target_degree = tgt[0], tgt[1]
+                rest = rest[:idx]
+
+        quality = "major" if is_upper else "minor"
+        if rest.startswith("°"):
+            quality, rest = "dim", rest[1:]
+        elif rest.startswith("ø"):
+            quality, rest = "halfdim", rest[1:]
+        elif rest.startswith("+"):
+            quality, rest = "aug", rest[1:]
+
+        scale = major_scale(key)
+        if target_degree is not None:
+            t_letter = scale[target_degree - 1][0]
+            t_semitone = (note_semitone(scale[target_degree - 1]) + target_shift) % 12
+            letter = LETTERS[(LETTERS.index(t_letter) + (degree - 1)) % 7]
+            root_semitone = (t_semitone + MAJOR_INTERVALS[degree - 1] + shift) % 12
+        else:
+            letter = scale[degree - 1][0]
+            root_semitone = (note_semitone(scale[degree - 1]) + shift) % 12
+        root_spelled = spell_letter(letter, root_semitone)
+
+        bass_index, has7, seventh_kind, tail = resolve_figure(rest)
+        if quality == "halfdim":
+            has7, seventh_kind = True, "min7"
+
+        base_ivals = {"major": [0, 4, 7], "minor": [0, 3, 7], "dim": [0, 3, 6],
+                      "aug": [0, 4, 8], "halfdim": [0, 3, 6]}[quality]
+        ivals = list(base_ivals)
+        if has7:
+            ivals.append(seventh_interval(quality, seventh_kind))
+        bass_index = min(bass_index, len(ivals) - 1)
+        bass_semitone = (root_semitone + ivals[bass_index]) % 12
+        bass_letter = LETTERS[(LETTERS.index(letter) + 2 * bass_index) % 7]
+        bass_spelled = spell_letter(bass_letter, bass_semitone)
+
+        chord_str = root_spelled + quality_to_suffix(quality, has7, seventh_kind) + tail
+        if bass_index != 0:
+            chord_str += "/" + bass_spelled
+        return chord_str
+    except Exception:
+        return token  # anything we can't confidently parse is shown as-is
+
+
+# ---- chord name -> roman numeral (the reverse of the above) ----------------
+_ROMAN_NUMERAL_TEXT = {1: "I", 2: "II", 3: "III", 4: "IV", 5: "V", 6: "VI", 7: "VII"}
+# Reverse of _FIGURE_INFO's canonical entries: (bass_index, has_seventh) -> figure text.
+_FIGURE_REVERSE = {(0, False): "", (1, False): "6", (2, False): "6/4",
+                   (0, True): "7", (1, True): "6/5", (2, True): "4/3", (3, True): "4/2"}
+_BASE_INTERVALS = {"major": [0, 4, 7], "minor": [0, 3, 7], "dim": [0, 3, 6],
+                   "aug": [0, 4, 8], "halfdim": [0, 3, 6]}
+
+
+def parse_chord_name_quality(suffix: str):
+    """The mirror image of quality_to_suffix(): given what follows the root
+    (and precedes any /bass), returns (quality, has7, seventh_kind).
+    Unrecognized extensions (sus4, add9, ...) are treated as a plain triad —
+    the same scope limit roman_to_chord_name has in the other direction."""
+    s = suffix
+    low = s.lower()
+    if low.startswith("maj7"):
+        return "major", True, "maj7"
+    if low.startswith("m(maj7)"):
+        return "minor", True, "maj7"
+    if s.startswith("°7") or low.startswith("dim7"):
+        return "dim", True, None
+    if s.startswith("°") or low.startswith("dim"):
+        return "dim", False, None
+    if s.startswith("ø"):
+        return "halfdim", True, None
+    if s.startswith("+7"):
+        return "aug", True, None
+    if s.startswith("+") or low.startswith("aug"):
+        return "aug", False, None
+    if low.startswith("m7") or s.startswith("-7"):
+        return "minor", True, None
+    if low.startswith("m") or s.startswith("-"):
+        return "minor", False, None
+    if s.startswith("7"):
+        return "major", True, None
+    return "major", False, None
+
+
+def chord_root_to_roman_degree(root_letter: str, root_semitone: int, key: str):
+    """Every one of the 7 natural letters appears in a key's major scale
+    exactly once, so this always finds a degree — chromatic roots come back
+    with a nonzero accidental shift relative to that degree's diatonic pitch."""
+    scale = major_scale(key)
+    for deg_idx in range(7):
+        if scale[deg_idx][0] == root_letter:
+            diff = (root_semitone - note_semitone(scale[deg_idx])) % 12
+            if diff > 6:
+                diff -= 12
+            return deg_idx + 1, diff
+    return 1, 0  # unreachable in practice
+
+
+def chord_name_to_roman(token: str, key: str) -> str:
+    try:
+        m = re.match(r"^[A-Ga-g][#b]?", token)
+        if not m:
+            return token
+        root = m.group(0)
+        root_semitone = note_semitone(root)
+        rest = token[len(m.group(0)):]
+
+        bass_root = None
+        if "/" in rest:
+            idx = rest.index("/")
+            after = rest[idx + 1 :]
+            bm = re.match(r"^[A-Ga-g][#b]?", after)
+            if bm and bm.group(0) == after:
+                bass_root, rest = after, rest[:idx]
+
+        quality, has7, seventh_kind = parse_chord_name_quality(rest)
+        if quality == "halfdim":
+            has7 = True
+
+        degree, acc_diff = chord_root_to_roman_degree(root[0].upper(), root_semitone, key)
+        numeral = _ROMAN_NUMERAL_TEXT[degree]
+        numeral = numeral if quality in ("major", "aug") else numeral.lower()
+        numeral = ("#" * acc_diff if acc_diff > 0 else "b" * (-acc_diff)) + numeral
+
+        bass_index = 0
+        if bass_root is not None and seventh_kind != "maj7":
+            ivals = list(_BASE_INTERVALS[quality])
+            if has7:
+                ivals.append(seventh_interval(quality, seventh_kind))
+            target = (note_semitone(bass_root) - root_semitone) % 12
+            for idx, iv in enumerate(ivals):
+                if iv == target:
+                    bass_index = idx
+                    break
+
+        quality_symbol = {"dim": "°", "halfdim": "ø", "aug": "+"}.get(quality, "")
+        figure = "Δ" if seventh_kind == "maj7" else _FIGURE_REVERSE.get((bass_index, has7), "7" if has7 else "")
+        return numeral + quality_symbol + figure
+    except Exception:
+        return token  # anything we can't confidently parse is shown as-is
+
+
+# ---- chord-name transposition ----------------------------------------------
+def transpose_note(note: str, from_key: str, to_key: str) -> str:
+    scale_from = major_scale(from_key)
+    if note in scale_from:
+        return major_scale(to_key)[scale_from.index(note)]
+    shift = (note_semitone(to_key) - note_semitone(from_key)) % 12
+    target_semitone = (note_semitone(note) + shift) % 12
+    return respell(target_semitone, to_key in FLAT_KEYS)
+
+
+def transpose_chord_token(token: str, from_key: str, to_key: str) -> str:
+    if from_key == to_key:
+        return token
+    try:
+        m = re.match(r"^[A-Ga-g][#b]?", token)
+        if not m:
+            return token
+        root, rest = m.group(0), token[len(m.group(0)) :]
+        new_root = transpose_note(root, from_key, to_key)
+        if "/" in rest:
+            idx = rest.index("/")
+            pre, bass_part = rest[:idx], rest[idx + 1 :]
+            bm = re.match(r"^[A-Ga-g][#b]?", bass_part)
+            if bm:
+                new_bass = transpose_note(bm.group(0), from_key, to_key)
+                rest = pre + "/" + new_bass + bass_part[len(bm.group(0)) :]
+        return new_root + rest
+    except Exception:
+        return token
+
+
+# ---- what to actually display, given the current mode/publish settings ----
+# Input mode (how you type) and publish mode (what's shown) are independent:
+# any combination of the two is valid, e.g. type chord names but publish as
+# Roman numerals, or vice versa.
+def current_display_parse_mode() -> str:
+    return "roman" if st.session_state.get("publish_display") == "Roman numerals" else "name"
+
+
+def resolve_display_text(raw_text: str, roman_key: str = None) -> str:
+    if not raw_text or not raw_text.strip():
+        return raw_text
+    input_mode = st.session_state["input_mode"]
+    publish_as_roman = st.session_state.get("publish_display") == "Roman numerals"
+    out = []
+    for tok in raw_text.strip().split():
+        if input_mode == "roman" and not publish_as_roman:
+            key = roman_key if roman_key is not None else st.session_state.get("publish_key", "C")
+            out.append(roman_to_chord_name(tok, key))
+        elif input_mode == "name" and publish_as_roman:
+            out.append(chord_name_to_roman(tok, st.session_state.get("written_key", "C")))
+        elif input_mode == "name" and not publish_as_roman:
+            wk, pk = st.session_state.get("written_key", "C"), st.session_state.get("publish_key", "C")
+            out.append(transpose_chord_token(tok, wk, pk))
+        else:
+            out.append(tok)  # input_mode == "roman" and publish_as_roman: shown as typed
+    return " ".join(out)
+
+
+def compute_modulations(data: dict):
+    """Returns a list (parallel to data["sections"]) of per-measure
+    (effective_key, pivot_shift) pairs. pivot_shift is the value a measure
+    explicitly set there (None elsewhere and whenever not in roman mode);
+    effective_key is the key in force at that measure (None outside roman
+    mode). The shift persists across sections until a later measure resets
+    it, so this is computed once and shared by the preview and the PDF."""
+    is_roman = data["input_mode"] == "roman"
+    publish_key = data.get("publish_key", "C")
+    running_shift = 0
+    result = []
+    for sec in data["sections"]:
+        measures = sec["measures"]
+        key_changes = sec.get("key_changes", [None] * len(measures))
+        per_measure = []
+        for gi in range(len(measures)):
+            pivot_shift = key_changes[gi] if gi < len(key_changes) else None
+            if is_roman and pivot_shift is not None:
+                running_shift = pivot_shift
+            if is_roman:
+                effective_key = publish_key if running_shift == 0 else shift_key(publish_key, running_shift)
+            else:
+                effective_key = None
+            per_measure.append((effective_key, pivot_shift if is_roman else None))
+        result.append(per_measure)
+    return result
+
+
+# --------------------------------------------------------------------------
+# Section helpers
+# --------------------------------------------------------------------------
+def new_section(measure_count: int = 8):
+    sid = st.session_state["next_id"]
+    st.session_state["next_id"] += 1
+    st.session_state["section_order"].append(sid)
+    st.session_state[f"name_{sid}"] = ""
+    st.session_state[f"repeats_{sid}"] = 1
+    st.session_state[f"mcount_{sid}"] = measure_count
+    for i in range(measure_count):
+        st.session_state[f"m_{sid}_{i}"] = ""
+        set_key_change(sid, i, None)
+
+
+def remove_section(sid: int):
+    st.session_state["section_order"] = [s for s in st.session_state["section_order"] if s != sid]
+
+
+def move_section(sid: int, direction: int):
+    order = st.session_state["section_order"]
+    idx = order.index(sid)
+    target = idx + direction
+    if 0 <= target < len(order):
+        order[idx], order[target] = order[target], order[idx]
+
+
+def on_measure_count_change(sid: int):
+    n = st.session_state[f"mcount_{sid}"]
+    n = max(1, min(64, n))
+    st.session_state[f"mcount_{sid}"] = n
+    for i in range(n):
+        st.session_state.setdefault(f"m_{sid}_{i}", "")
+        st.session_state.setdefault(f"mkey_{sid}_{i}", NO_KEY_CHANGE)
+
+
+def on_measure_text_change(sid: int, idx: int):
+    key = f"m_{sid}_{idx}"
+    st.session_state[key] = apply_chord_shorthand(st.session_state[key])
+
+
+# --------------------------------------------------------------------------
+# Copy / paste — an in-app clipboard (session_state), since Streamlit has no
+# direct access to the system clipboard. Holds either a range of measures
+# or an entire section at a time.
+# --------------------------------------------------------------------------
+def _section_snapshot(sid: int) -> dict:
+    """Everything about a section except its id/order — used by copy and by
+    the autosave/file format alike."""
+    n = st.session_state[f"mcount_{sid}"]
+    return {
+        "name": st.session_state.get(f"name_{sid}", ""),
+        "repeats": st.session_state.get(f"repeats_{sid}", 1),
+        "measures": [st.session_state.get(f"m_{sid}_{i}", "") for i in range(n)],
+        "key_changes": [get_key_change(sid, i) for i in range(n)],
+    }
+
+
+def _apply_section_snapshot(sid: int, data: dict):
+    """Write a _section_snapshot()-shaped dict into a (possibly new) section."""
+    st.session_state[f"name_{sid}"] = data.get("name", "")
+    st.session_state[f"repeats_{sid}"] = data.get("repeats", 1)
+    measures = data.get("measures", [])
+    key_changes = data.get("key_changes", [None] * len(measures))
+    st.session_state[f"mcount_{sid}"] = len(measures)
+    for i, v in enumerate(measures):
+        st.session_state[f"m_{sid}_{i}"] = v
+    for i, v in enumerate(key_changes):
+        set_key_change(sid, i, v)
+
+
+def copy_measures(sid: int, letter: str, start_1idx: int, end_1idx: int):
+    n = st.session_state[f"mcount_{sid}"]
+    start = max(1, min(start_1idx, n)) - 1
+    end = max(1, min(end_1idx, n))
+    if end <= start:
+        return
+    texts = [st.session_state.get(f"m_{sid}_{i}", "") for i in range(start, end)]
+    key_changes = [get_key_change(sid, i) for i in range(start, end)]
+    st.session_state["clipboard"] = {
+        "type": "measures",
+        "data": texts,
+        "key_changes": key_changes,
+        "desc": f"{len(texts)} measure{'s' if len(texts) != 1 else ''} from section {letter} (m.{start + 1}–{end})",
+    }
+
+
+def copy_section(sid: int, letter: str):
+    n = st.session_state[f"mcount_{sid}"]
+    st.session_state["clipboard"] = {
+        "type": "section",
+        "data": _section_snapshot(sid),
+        "desc": f"section {letter} ({n} measures)",
+    }
+
+
+def paste_measures_into(sid: int, at_1idx: int):
+    clip = st.session_state.get("clipboard")
+    if not clip or clip["type"] != "measures":
+        return
+    texts = clip["data"]
+    kchanges = clip.get("key_changes", [None] * len(texts))
+    n = st.session_state[f"mcount_{sid}"]
+    old_texts = [st.session_state.get(f"m_{sid}_{i}", "") for i in range(n)]
+    old_keys = [get_key_change(sid, i) for i in range(n)]
+    at = max(0, min(at_1idx - 1, n))
+    new_texts = (old_texts[:at] + list(texts) + old_texts[at:])[:64]
+    new_keys = (old_keys[:at] + list(kchanges) + old_keys[at:])[:64]
+    st.session_state[f"mcount_{sid}"] = len(new_texts)
+    for i, v in enumerate(new_texts):
+        st.session_state[f"m_{sid}_{i}"] = v
+    for i, v in enumerate(new_keys):
+        set_key_change(sid, i, v)
+
+
+def paste_section_after(after_sid):
+    clip = st.session_state.get("clipboard")
+    if not clip or clip["type"] != "section":
+        return
+    new_sid = st.session_state["next_id"]
+    st.session_state["next_id"] += 1
+    _apply_section_snapshot(new_sid, clip["data"])
+    order = st.session_state["section_order"]
+    if after_sid is None:
+        order.append(new_sid)
+    else:
+        order.insert(order.index(after_sid) + 1, new_sid)
+
+
+def replace_section(sid: int):
+    clip = st.session_state.get("clipboard")
+    if not clip or clip["type"] != "section":
+        return
+    _apply_section_snapshot(sid, clip["data"])
+
+
+def clear_clipboard():
+    st.session_state["clipboard"] = None
+
+
+# --------------------------------------------------------------------------
+# Initial state
+# --------------------------------------------------------------------------
+if "initialized" not in st.session_state:
+    st.session_state["initialized"] = True
+    st.session_state["title"] = "Untitled Chart"
+    st.session_state["notes"] = ""
+    st.session_state["input_mode"] = "roman"
+    st.session_state["publish_display"] = "Roman numerals"
+    st.session_state["written_key"] = "C"
+    st.session_state["publish_key"] = "C"
+    st.session_state["file_folder"] = str(DEFAULT_CHART_FOLDER)
+    st.session_state["bg_color"] = "#EEEAE0"
+    st.session_state["fg_color"] = "#2A241E"
+    st.session_state["file_name"] = sanitize_filename(st.session_state["title"])
+    st.session_state["save_status"] = "idle"
+    st.session_state["clipboard"] = None
+    st.session_state["next_id"] = 2
+    st.session_state["section_order"] = [1]
+    st.session_state["name_1"] = ""
+    st.session_state["repeats_1"] = 1
+    st.session_state["mcount_1"] = 8
+    for i in range(8):
+        st.session_state[f"m_1_{i}"] = ""
+        set_key_change(1, i, None)
+    load_from_disk()  # pull in a previously saved chart, if one exists
+
+# --------------------------------------------------------------------------
+# Page setup + styling
+# --------------------------------------------------------------------------
+st.set_page_config(page_title="Chord Chart", layout="wide")
+
+INK = st.session_state.get("fg_color", "#2A241E")
+PAPER = st.session_state.get("bg_color", "#EEEAE0")
+ACCENT = "#7A2E2E"
+PAPER_CARD = PAPER
+RULE = hex_to_rgba_css(INK, 0.35)
+MUTED = hex_to_rgba_css(INK, 0.65)
+MUTED2 = hex_to_rgba_css(INK, 0.5)
+
+st.markdown(
+    f"""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,500;0,600;1,500;1,600&family=JetBrains+Mono:wght@400;500;600&display=swap');
+    .stApp {{ background: {PAPER}; }}
+    .block-container {{ padding-top: calc(2rem + 0.5in); max-width: 1200px; }}
+
+    .chart-paper {{ background: {PAPER}; border: 1px solid {RULE}; padding: 24px 28px; }}
+    .chart-title {{ font-family: 'EB Garamond', serif; font-weight: 600; font-size: 32px; color: {INK}; }}
+
+    .notes-box {{ margin-bottom: 26px; }}
+    .notes-label {{ display:block; margin-bottom:4px; font-family:'JetBrains Mono',monospace; font-size:10px; letter-spacing:0.08em; color:{MUTED2}; }}
+    .notes-text {{ font-family:'EB Garamond', serif; font-style:italic; font-size:15px; color:{INK}; border:1px solid {RULE}; background:{PAPER_CARD}; padding:8px 12px; white-space:pre-wrap; min-height: 1.4em; }}
+
+    .section-block {{ margin-bottom: 34px; }}
+    .section-header {{ display:flex; align-items:baseline; gap:12px; margin-bottom:8px; }}
+    .section-letter {{ font-family:'EB Garamond', serif; font-weight:600; font-size:24px; color:{INK}; }}
+    .section-name {{ font-family:'JetBrains Mono',monospace; font-size:12px; color:{MUTED}; letter-spacing:0.03em; }}
+    .section-repeat-note {{ font-family:'JetBrains Mono',monospace; font-size:11px; color:{ACCENT}; }}
+    .section-hr {{ flex:1; border-bottom:1px solid {RULE}; }}
+
+    .system-row {{ display:flex; }}
+    .measure-box {{ position:relative; flex:1; min-width:86px; min-height:60px; display:flex; align-items:center; justify-content:center;
+                    border-top:1.5px solid {INK}; border-bottom:1.5px solid {INK}; }}
+    .measure-index {{ position:absolute; top:3px; left:7px; font-family:'JetBrains Mono',monospace; font-size:9px; color:{RULE}; }}
+    .key-change {{ position:absolute; top:3px; right:7px; font-family:'JetBrains Mono',monospace; font-size:9px; font-weight:600; color:{ACCENT}; }}
+    .chord {{ font-family:'EB Garamond', serif; font-style:italic; font-size:21px; color:{INK}; }}
+    .chord-token {{ margin: 0 6px; white-space: nowrap; }}
+    .chord-token sup {{ font-size:0.6em; margin-left:1px; }}
+
+    .repeat-start, .repeat-end {{ position:absolute; top:0; bottom:0; display:flex; align-items:center; }}
+    .repeat-start {{ left:-2px; }}
+    .repeat-end {{ right:-2px; }}
+    .repeat-start .bar, .repeat-end .bar {{ width:4px; align-self:stretch; background:{ACCENT}; }}
+    .repeat-start .dots, .repeat-end .dots {{ display:flex; flex-direction:column; gap:5px; }}
+    .repeat-start .dots {{ margin-left:3px; }}
+    .repeat-end .dots {{ margin-right:3px; }}
+    .repeat-start .dots span, .repeat-end .dots span {{ width:5px; height:5px; border-radius:9999px; background:{ACCENT}; display:block; }}
+    .repeat-end .count {{ position:absolute; top:-18px; right:0; font-family:'JetBrains Mono',monospace; font-weight:600; font-size:11px; color:{ACCENT}; }}
+
+    .editor-card {{ background:{PAPER_CARD}; border:1px solid {RULE}; padding:14px; margin-bottom:14px; }}
+    .editor-letter {{ display:inline-flex; align-items:center; justify-content:center; width:28px; height:28px; border:1.5px solid {INK};
+                       font-family:'EB Garamond', serif; font-size:16px; color:{INK}; }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+def on_title_change():
+    if not st.session_state.get("file_name_touched", False):
+        st.session_state["file_name"] = sanitize_filename(st.session_state["title"])
+
+
+def on_filename_change():
+    st.session_state["file_name_touched"] = True
+
+
+# --------------------------------------------------------------------------
+# Header
+# --------------------------------------------------------------------------
+col_title, col_actions = st.columns([3, 2])
+
+with col_title:
+    st.text_input(
+        "Title", key="title", label_visibility="collapsed", placeholder="Chart title",
+        on_change=on_title_change,
+    )
+
+with col_actions:
+    a, c1 = st.columns([2, 1])
+    with a:
+        if st.session_state.get("save_status") == "error":
+            st.error(f"Couldn't save: {st.session_state.get('save_error', '')}", icon="⚠️")
+        elif st.session_state.get("save_status") == "saved":
+            st.caption(f"💾 Saved to disk at {st.session_state.get('save_time', '')}")
+        else:
+            st.caption("💾 Saving…")
+    with c1:
+        pdf_placeholder = st.container()
+
+# --------------------------------------------------------------------------
+# Appearance — background/foreground colors, for contrast
+# --------------------------------------------------------------------------
+with st.expander("Appearance (colors & font)", expanded=False):
+    ap1, ap2 = st.columns(2)
+    with ap1:
+        st.color_picker("Background color", key="bg_color")
+    with ap2:
+        st.color_picker("Text / line color", key="fg_color")
+    st.caption("Applies to the chart on screen and in the exported PDF.")
+    if REALBOOK_AVAILABLE:
+        st.caption(f"PDF font: using {REALBOOK_FONT_FILE} from the fonts folder.")
+    else:
+        st.caption(
+            "PDF font: no Realbook-style font found, so PDFs use Times Bold Italic. "
+            "Drop a .ttf/.otf you're licensed to use (e.g. MuseJazz) into a \"fonts\" "
+            "folder next to app.py to switch the PDF to that font."
+        )
+
+# --------------------------------------------------------------------------
+# Input mode + publish/transpose settings
+# --------------------------------------------------------------------------
+def on_input_mode_change():
+    new_mode = "roman" if st.session_state["input_mode_radio"] == "Roman numerals" else "name"
+    prev_mode = st.session_state.get("input_mode", "roman")
+    st.session_state["input_mode"] = new_mode
+    if new_mode != prev_mode:
+        # Default the output to match on a mode switch (least surprise), but
+        # this is just a default — publish_display can still be changed
+        # independently afterward.
+        st.session_state["publish_display"] = "Roman numerals" if new_mode == "roman" else "Chord names"
+
+
+with st.expander("Input mode & publish settings", expanded=False):
+    mode_col, settings_col = st.columns([1, 2])
+    with mode_col:
+        st.radio(
+            "Enter chords as",
+            ["Roman numerals", "Chord names"],
+            index=0 if st.session_state["input_mode"] == "roman" else 1,
+            key="input_mode_radio",
+            on_change=on_input_mode_change,
+        )
+        if st.session_state["input_mode"] == "roman":
+            st.caption(
+                "e.g. V7, ii6, vii°7, V7/V — type the numeral then anything else; "
+                "it's superscripted automatically. \"^\" always means major 7th (Δ)."
+            )
+        else:
+            st.caption(
+                "e.g. E7, Ab^ (= Ab major 7), Dm7, C/E — type the root then anything else; "
+                "it's superscripted automatically. \"^\" always means major 7th (Δ)."
+            )
+
+    with settings_col:
+        st.radio(
+            "Publish chart as",
+            ["Roman numerals", "Chord names"],
+            key="publish_display",
+            horizontal=True,
+        )
+        input_mode = st.session_state["input_mode"]
+        publish_as_roman = st.session_state["publish_display"] == "Roman numerals"
+
+        if input_mode == "name":
+            st.selectbox("Chart is written in", MAJOR_KEYS, key="written_key")
+
+        if not publish_as_roman:
+            st.selectbox("Key for chord names", MAJOR_KEYS, key="publish_key")
+
+        if input_mode == "roman" and not publish_as_roman:
+            st.caption(
+                "Converts triads, seventh chords, standard inversions (6, 6/4, 6/5, 4/3, 4/2), "
+                "and one level of secondary dominant (e.g. V7/V). Anything else is shown as typed."
+            )
+        elif input_mode == "name" and publish_as_roman:
+            st.caption(
+                f"Analyzed relative to {st.session_state['written_key']} major. Handles triads, "
+                "seventh chords, and standard inversions (6, 6/4, 6/5, 4/3, 4/2). Unusual "
+                "extensions (sus4, add9, …) are read as a plain triad."
+            )
+        elif input_mode == "name" and not publish_as_roman:
+            if st.session_state["written_key"] != st.session_state["publish_key"]:
+                st.caption(f"Transposing from {st.session_state['written_key']} to {st.session_state['publish_key']}.")
+
+# --------------------------------------------------------------------------
+# Save / load named chart files (separate from the automatic session autosave)
+# --------------------------------------------------------------------------
+with st.expander("Save / load chart files", expanded=False):
+    st.caption(
+        "Download saves a \".chord\" file to your device. The folder below is "
+        "only used to browse and load files already sitting on whichever "
+        "machine is running this app."
+    )
+    fc1, fc2 = st.columns([2, 1])
+    with fc1:
+        st.text_input("Folder", key="file_folder")
+    with fc2:
+        st.text_input("File name", key="file_name", on_change=on_filename_change)
+
+    st.download_button(
+        "⬇ Download JSON",
+        data=json.dumps(collect_data(), ensure_ascii=False, indent=2),
+        file_name=ensure_chord_filename(st.session_state["file_name"]),
+        mime="application/json",
+    )
+
+    st.divider()
+
+    files = list_chart_files(st.session_state["file_folder"])
+    if files:
+        if st.session_state.get("file_pick") not in files:
+            st.session_state["file_pick"] = files[0]
+        st.selectbox("Chart files in this folder", files, key="file_pick")
+        lc1, lc2 = st.columns(2)
+        with lc1:
+            st.button(
+                "📂 Load selected file", key="load_named_file",
+                on_click=load_chart_from_path,
+                args=(str(Path(st.session_state["file_folder"]).expanduser() / st.session_state["file_pick"]),),
+                use_container_width=True,
+            )
+        with lc2:
+            try:
+                selected_bytes = (Path(st.session_state["file_folder"]).expanduser() / st.session_state["file_pick"]).read_bytes()
+            except Exception:
+                selected_bytes = b""
+            st.download_button(
+                "⬇ Download this file", data=selected_bytes, file_name=st.session_state["file_pick"],
+                mime="application/json", use_container_width=True,
+            )
+    else:
+        st.caption("No .chord files found in that folder yet.")
+
+    uploaded = st.file_uploader("…or pick a file to load", type=["chord"], key="chart_upload")
+    if uploaded is not None:
+        st.button(
+            "📂 Load uploaded file", key="load_uploaded_file",
+            on_click=load_chart_from_upload, args=(uploaded,),
+        )
+    load_status = st.session_state.get("file_load_status")
+    if load_status:
+        kind, msg = load_status
+        (st.success if kind == "ok" else st.error)(f"{'Loaded' if kind == 'ok' else 'Could not load'}: {msg}")
+
+# --------------------------------------------------------------------------
+# Editor + output — each section's output renders right next to its own
+# editor, so entering chords into a section further down the page doesn't
+# require scrolling back up to a separate preview.
+# --------------------------------------------------------------------------
+data = collect_data()
+_parse_mode = current_display_parse_mode()
+_modulations = compute_modulations(data)
+
+header_col1, header_col2 = st.columns([2, 3])
+with header_col1:
+    st.text_area("Notes", key="notes", placeholder="Tempo, feel, dynamics, performance notes…", height=80)
+
+    clip = st.session_state.get("clipboard")
+    if clip:
+        cc1, cc2 = st.columns([4, 1])
+        with cc1:
+            st.caption(f"📋 Copied: {clip['desc']}")
+        with cc2:
+            st.button("Clear", key="clear_clip", on_click=clear_clipboard, use_container_width=True)
+with header_col2:
+    top_parts = [f'<div class="chart-paper"><div class="chart-title">{html.escape(data["title"])}</div>']
+    if data["notes"].strip():
+        top_parts.append(
+            '<div class="notes-box"><span class="notes-label">NOTES</span>'
+            f'<div class="notes-text">{html.escape(data["notes"])}</div></div>'
+        )
+    top_parts.append("</div>")
+    st.markdown("".join(top_parts), unsafe_allow_html=True)
+
+for idx, sid in enumerate(list(st.session_state["section_order"])):
+    letter = chr(65 + idx)
+    editor_col, preview_col = st.columns([2, 3])
+    with editor_col:
+        with st.container():
+            st.markdown('<div class="editor-card">', unsafe_allow_html=True)
+            top = st.columns([0.6, 3.2, 0.5, 0.5, 0.5])
+            with top[0]:
+                st.markdown(f'<span class="editor-letter">{letter}</span>', unsafe_allow_html=True)
+            with top[1]:
+                st.text_input(
+                    "Section name",
+                    key=f"name_{sid}",
+                    label_visibility="collapsed",
+                    placeholder="Section name (optional) — Verse, Chorus…",
+                )
+            with top[2]:
+                st.button("↑", key=f"up_{sid}", disabled=idx == 0, on_click=move_section, args=(sid, -1))
+            with top[3]:
+                st.button("↓", key=f"down_{sid}", disabled=idx == len(st.session_state["section_order"]) - 1, on_click=move_section, args=(sid, 1))
+            with top[4]:
+                st.button("✕", key=f"del_{sid}", on_click=remove_section, args=(sid,))
+
+            m1, m2 = st.columns(2)
+            with m1:
+                st.number_input(
+                    "Measures", min_value=1, max_value=64, key=f"mcount_{sid}",
+                    on_change=on_measure_count_change, args=(sid,),
+                )
+            with m2:
+                st.number_input("Repeat ×", min_value=1, max_value=20, key=f"repeats_{sid}")
+
+            if st.session_state["input_mode"] == "roman":
+                st.caption("Roman-numeral mode: set a key change on any measure below to modulate from there on.")
+
+            n = st.session_state[f"mcount_{sid}"]
+            for row_start in range(0, n, 4):
+                row_end = min(row_start + 4, n)
+                show_row_keys = True
+                if st.session_state["input_mode"] == "roman":
+                    row_toggle_key = f"showkey_{sid}_{row_start}"
+                    st.session_state.setdefault(row_toggle_key, False)
+                    st.toggle(f"Key changes for m.{row_start + 1}–{row_end}", key=row_toggle_key)
+                    show_row_keys = st.session_state[row_toggle_key]
+
+                cols = st.columns(4)
+                for c in range(4):
+                    i = row_start + c
+                    if i >= n:
+                        continue
+                    with cols[c]:
+                        st.caption(f"m.{i + 1}")
+                        st.text_input(
+                            f"measure {i}", key=f"m_{sid}_{i}", label_visibility="collapsed",
+                            placeholder=("V7" if st.session_state["input_mode"] == "roman" else "E7"),
+                            on_change=on_measure_text_change, args=(sid, i),
+                        )
+                        if st.session_state["input_mode"] == "roman":
+                            st.session_state.setdefault(f"mkey_{sid}_{i}", NO_KEY_CHANGE)
+                            if show_row_keys:
+                                st.selectbox(
+                                    f"key change m.{i}", options=KEY_CHANGE_OPTIONS,
+                                    format_func=key_change_label, key=f"mkey_{sid}_{i}",
+                                    label_visibility="collapsed",
+                                )
+
+            with st.expander("Copy / paste"):
+                st.session_state[f"copyfrom_{sid}"] = min(st.session_state.get(f"copyfrom_{sid}", 1), n)
+                st.session_state[f"copyto_{sid}"] = min(st.session_state.get(f"copyto_{sid}", n), n)
+                cp1, cp2, cp3 = st.columns([1, 1, 1.4])
+                with cp1:
+                    st.number_input("From m.", min_value=1, max_value=n, key=f"copyfrom_{sid}")
+                with cp2:
+                    st.number_input("To m.", min_value=1, max_value=n, key=f"copyto_{sid}")
+                with cp3:
+                    st.write("")
+                    st.button(
+                        "Copy measures",
+                        key=f"copymeasures_{sid}",
+                        use_container_width=True,
+                        on_click=copy_measures,
+                        args=(sid, letter, st.session_state[f"copyfrom_{sid}"], st.session_state[f"copyto_{sid}"]),
+                    )
+                st.button(
+                    "Copy whole section",
+                    key=f"copysection_{sid}",
+                    use_container_width=True,
+                    on_click=copy_section,
+                    args=(sid, letter),
+                )
+
+                clip = st.session_state.get("clipboard")
+                if clip and clip["type"] == "measures":
+                    st.session_state[f"pasteat_{sid}"] = min(st.session_state.get(f"pasteat_{sid}", n + 1), n + 1)
+                    pp1, pp2 = st.columns([1, 1.4])
+                    with pp1:
+                        st.number_input("Insert before m.", min_value=1, max_value=n + 1, key=f"pasteat_{sid}")
+                    with pp2:
+                        st.write("")
+                        st.button(
+                            "Paste measures",
+                            key=f"pastemeasures_{sid}",
+                            use_container_width=True,
+                            on_click=paste_measures_into,
+                            args=(sid, st.session_state[f"pasteat_{sid}"]),
+                        )
+                elif clip and clip["type"] == "section":
+                    pp1, pp2 = st.columns(2)
+                    with pp1:
+                        st.button(
+                            "Paste as new section after",
+                            key=f"pasteafter_{sid}",
+                            use_container_width=True,
+                            on_click=paste_section_after,
+                            args=(sid,),
+                        )
+                    with pp2:
+                        st.button(
+                            "Replace this section",
+                            key=f"pastereplace_{sid}",
+                            use_container_width=True,
+                            on_click=replace_section,
+                            args=(sid,),
+                        )
+
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    with preview_col:
+        # data/_modulations were collected once, before this loop, so every
+        # section's output here reflects the same snapshot as the PDF below.
+        sec_data = data["sections"][idx]
+        sec_html = render_section_html(sec_data, _modulations[idx], _parse_mode)
+        st.markdown(f'<div class="chart-paper">{sec_html}</div>', unsafe_allow_html=True)
+
+st.button("＋ Add section", on_click=new_section, use_container_width=True)
+clip = st.session_state.get("clipboard")
+if clip and clip["type"] == "section":
+    st.button(
+        "＋ Paste as new section",
+        on_click=paste_section_after,
+        args=(None,),
+        use_container_width=True,
+    )
+
+# --------------------------------------------------------------------------
+# PDF export (this replaces the browser print button — it always works
+# because the file is generated in Python, not via the browser)
+# --------------------------------------------------------------------------
+def render_chord_pdf(c: canvas.Canvas, text: str, bx: float, by: float, bw: float, bh: float, mode: str):
+    if not text or not text.strip():
+        return
+    pieces = [parse_chord_token(tok, mode) for tok in text.strip().split()]
+    base_font, sup_font, base_size, sup_size = PDF_FONT_CHORD, PDF_FONT_CHORD, 15, 9
+    seg_widths = []
+    for base, sup, slash in pieces:
+        w = stringWidth(base, base_font, base_size)
+        if sup:
+            w += stringWidth(sup, sup_font, sup_size) + 1
+        if slash:
+            w += stringWidth(slash, base_font, base_size)
+        seg_widths.append(w)
+    total = sum(seg_widths) + 8 * max(0, len(pieces) - 1)
+    curx = bx + bw / 2 - total / 2
+    cy = by + bh / 2 - 4
+    for (base, sup, slash), w in zip(pieces, seg_widths):
+        c.setFont(base_font, base_size)
+        c.drawString(curx, cy, base)
+        curx += stringWidth(base, base_font, base_size)
+        if sup:
+            c.setFont(sup_font, sup_size)
+            c.drawString(curx + 1, cy + 6, sup)
+            curx += stringWidth(sup, sup_font, sup_size) + 1
+        if slash:
+            c.setFont(base_font, base_size)
+            c.drawString(curx, cy, slash)
+            curx += stringWidth(slash, base_font, base_size)
+        curx += 8
+
+
+def build_pdf(data: dict, parse_mode: str) -> bytes:
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=LETTER_SIZE)
+    width, height = LETTER_SIZE
+    margin = 0.6 * inch
+    x, y = margin, height - margin
+
+    bg_rgb = hex_to_rgb01(data.get("bg_color", "#EEEAE0"))
+    fg_rgb = hex_to_rgb01(data.get("fg_color", "#2A241E"))
+
+    def _paint_page_background():
+        c.setFillColorRGB(*bg_rgb)
+        c.rect(0, 0, width, height, fill=1, stroke=0)
+        c.setFillColorRGB(*fg_rgb)
+        c.setStrokeColorRGB(*fg_rgb)
+
+    _paint_page_background()
+
+    c.setFont(PDF_FONT_TITLE, 20)
+    c.drawString(x, y, data["title"] or "Untitled Chart")
+    y -= 20
+    if data["notes"].strip():
+        c.setFont(PDF_FONT_BODY, 10)
+        for line in textwrap.wrap(data["notes"], 95) or [""]:
+            c.drawString(x, y, line)
+            y -= 13
+        y -= 6
+
+    box_w = (width - 2 * margin) / 4
+    box_h = 0.55 * inch
+    modulations = compute_modulations(data)
+
+    for sec_idx, sec in enumerate(data["sections"]):
+        if y < margin + box_h * 2:
+            c.showPage()
+            _paint_page_background()
+            y = height - margin
+        c.setFont(PDF_FONT_TITLE, 13)
+        label = sec["label"]
+        if sec["name"]:
+            label += "   " + sec["name"].upper()
+        if sec["repeats"] > 1:
+            label += f"   (play x{sec['repeats']})"
+        c.drawString(x, y, label)
+        y -= 6
+        c.line(x, y, width - margin, y)
+        y -= box_h
+
+        measures = sec["measures"]
+        sec_mods = modulations[sec_idx]
+        n = len(measures)
+        for row_start in range(0, n, 4):
+            if y < margin:
+                c.showPage()
+                _paint_page_background()
+                y = height - margin
+            row = measures[row_start : row_start + 4]
+            for i, text in enumerate(row):
+                gi = row_start + i
+                bx = x + i * box_w
+                c.setLineWidth(1)
+                c.rect(bx, y, box_w, box_h)
+                effective_key, pivot_shift = sec_mods[gi]
+                if pivot_shift is not None:
+                    c.setFont(PDF_FONT_LABEL, 7)
+                    c.setFillColorRGB(0.48, 0.18, 0.18)
+                    c.drawRightString(bx + box_w - 3, y + box_h - 9, f"\u2192 {effective_key} ({pivot_shift:+d})")
+                    c.setFillColorRGB(*fg_rgb)
+                render_chord_pdf(c, resolve_display_text(text, effective_key), bx, y, box_w, box_h, parse_mode)
+            if sec["repeats"] > 1:
+                is_first_row = row_start == 0
+                is_last_row = row_start + 4 >= n
+                c.setStrokeColorRGB(0.48, 0.18, 0.18)
+                if is_first_row:
+                    c.setLineWidth(3)
+                    c.line(x, y, x, y + box_h)
+                if is_last_row:
+                    end_x = x + len(row) * box_w
+                    c.setLineWidth(3)
+                    c.line(end_x, y, end_x, y + box_h)
+                    c.setFont(PDF_FONT_LABEL, 9)
+                    c.setFillColorRGB(0.48, 0.18, 0.18)
+                    c.drawRightString(end_x, y + box_h + 4, f"x{sec['repeats']}")
+                    c.setFillColorRGB(*fg_rgb)
+                c.setLineWidth(1)
+                c.setStrokeColorRGB(*fg_rgb)
+            y -= box_h
+        y -= 18
+
+    c.save()
+    buf.seek(0)
+    return buf.getvalue()
+
+
+with pdf_placeholder:
+    st.download_button(
+        "⬇ PDF",
+        data=build_pdf(data, _parse_mode),
+        file_name=f"{(data['title'] or 'chord-chart').strip().replace(' ', '-')}.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
+
+# Autosave on every rerun (i.e. after every edit) — a plain file write,
+# so there's no browser permission to fail.
+save_to_disk()
